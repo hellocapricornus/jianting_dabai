@@ -13,8 +13,8 @@ import sys
 import random
 from telethon import functions
 
-API_ID = 39566357
-API_HASH = "28e543e71117bdfe3708595d584cf41e"
+API_ID = 17124507
+API_HASH = "64fca6e2a6b1b4489388daddd5fbae7c"
 
 # ========= 夜间休眠 =========
 SLEEP_START = 3   # 凌晨3点
