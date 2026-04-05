@@ -627,26 +627,25 @@ async def forward_message(event, text):
 
 # ========= 发送警示消息 =========
 async def send_alert_with_mention(chat_id, message):
-    """发送警示消息（简化版：只发消息，不要按钮）"""
+    """发送警示消息"""
     try:
-        # 构建完整消息（使用 Markdown 格式的链接）
-        alert_header = "🔴🔴🔴 风险警示 🔴🔴🔴\n\n"
-        full_message = f"{alert_header}{message}\n\n@all @all @all"
-        
-        # 发送消息，使用 parse_mode='md' 让 Markdown 链接生效
+        # 直接发送传入的消息（已经包含完整格式）
         await client.send_message(
             chat_id, 
-            full_message, 
+            message, 
             parse_mode='md'
         )
+        
+        # 单独发送 @all 提醒
+        await asyncio.sleep(0.5)
+        await client.send_message(chat_id, "@all @all @all 请所有成员注意上方风险警示！")
         
         logger.info(f"已发送警示消息到 {chat_id}")
         
     except Exception as e:
         logger.error(f"发送警示消息失败: {e}")
-        # 降级：不使用 Markdown
         try:
-            await client.send_message(chat_id, f"🔴🔴🔴 风险警示 🔴🔴🔴\n\n{message}")
+            await client.send_message(chat_id, message)
         except:
             pass
 
@@ -659,7 +658,7 @@ async def check_and_alert(event):
         group_id = event.chat_id
         message_text = event.message.message if event.message else ""
         
-        # ========= 构建可点击的群组链接 =========
+        # ========= 构建可点击的群组链接（和转发消息格式完全一样）=========
         group_link = None
         try:
             if chat.username:
@@ -673,12 +672,13 @@ async def check_and_alert(event):
         except:
             group_link = None
         
-        # 构建可点击的群名（加上 safe_markdown）
+        # 构建可点击的群名 - 和转发消息格式完全一样
+        safe_group_name = safe_markdown(group_name)
         if group_link:
-            safe_group_name = safe_markdown(group_name)
+            # 格式：【[群名](链接)】 - 和转发消息一模一样
             clickable_group_name = f"【[{safe_group_name}]({group_link})】"
         else:
-            clickable_group_name = safe_markdown(group_name)
+            clickable_group_name = safe_group_name
         
         should_alert = False
         trigger_word = ""
@@ -714,16 +714,22 @@ async def check_and_alert(event):
         # 记录警示
         alert_manager.record_alert(group_id)
         
-        # 构建警示消息
+        # 构建警示消息 - 直接构建，不依赖配置文件
         alert_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        alert_message = config.ALERT_MESSAGE.format(
-            group_name=clickable_group_name,  # 使用可点击的群名
-            time=alert_time,
-            trigger_word=trigger_word
-        )
         
-        alert_message += f"\n\n📌 检测来源：{trigger_source}"
-        
+        # 完整消息格式（和转发消息一样，第一行就是可点击的群名）
+        alert_message = f"""{clickable_group_name}
+
+🔴🔴🔴 风险警示 🔴🔴🔴
+
+⚠️ 该群组已触发风险警示（{trigger_word}）
+
+请谨慎交易，注意资金安全！
+
+时间：{alert_time}
+
+📌 检测来源：{trigger_source}"""
+
         if message_text and trigger_source == "消息内容":
             alert_message += f"\n📝 触发消息：{message_text[:100]}"
         
