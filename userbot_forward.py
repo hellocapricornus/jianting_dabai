@@ -651,39 +651,18 @@ async def send_alert_with_mention(chat_id, message):
 
 # ========= 检测群组警示 =========
 async def check_and_alert(event):
-    """检测群组是否暂停作业并发送警示（增强版）"""
+    """检测群组是否暂停作业并发送警示"""
     try:
         chat = await event.get_chat()
         group_name = getattr(chat, "title", "未知群组")
         group_id = event.chat_id
         message_text = event.message.message if event.message else ""
         
-        # ========= 构建可点击的群组链接（和转发消息格式完全一样）=========
-        group_link = None
-        try:
-            if chat.username:
-                group_link = f"https://t.me/{chat.username}"
-            else:
-                chat_id_str = str(group_id)
-                if chat_id_str.startswith("-100"):
-                    group_link = f"https://t.me/c/{chat_id_str[4:]}"
-                else:
-                    group_link = f"https://t.me/c/{abs(group_id)}"
-        except:
-            group_link = None
-        
-        # 构建可点击的群名 - 和转发消息格式完全一样
-        clean_name = group_name.replace("(", "（").replace(")", "）").replace("_", "-").replace("*", "·")
-        if group_link:
-            clickable_group_name = f"【[{clean_name}]({group_link})】"
-        else:
-            clickable_group_name = clean_name
-        
         should_alert = False
         trigger_word = ""
         trigger_source = ""
         
-        # ========= 优先检查群名 =========
+        # 检查群名
         group_name_lower = group_name.lower()
         for kw in config.TRIGGER_KEYWORDS:
             if kw in group_name_lower:
@@ -692,7 +671,7 @@ async def check_and_alert(event):
                 trigger_source = "群名"
                 break
         
-        # ========= 检查消息内容 =========
+        # 检查消息内容
         if not should_alert and message_text:
             message_lower = message_text.lower()
             for kw in config.TRIGGER_KEYWORDS:
@@ -707,17 +686,28 @@ async def check_and_alert(event):
         
         # 检查冷却时间
         if not alert_manager.should_alert(group_id, group_name, message_text):
-            logger.debug(f"群组 {group_name} 在冷却期内，跳过警示")
             return False
         
-        # 记录警示
         alert_manager.record_alert(group_id)
         
-        # 构建警示消息 - 直接构建，不依赖配置文件
+        # ========= 使用和转发消息完全一样的格式 =========
+        # 处理群名（和 forward_message 一样）
+        chat_title = safe_markdown(group_name)
+        
+        # 构建聊天链接（和 forward_message 一样）
+        if getattr(chat, "username", None):
+            chat_link = f"https://t.me/{chat.username}"
+        else:
+            cid = str(group_id)
+            if cid.startswith("-100"):
+                chat_link = f"https://t.me/c/{cid[4:]}"
+            else:
+                chat_link = "https://t.me"
+        
+        # 和转发消息一模一样的格式
         alert_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
-        # 完整消息格式（和转发消息一样，第一行就是可点击的群名）
-        alert_message = f"""{clickable_group_name}
+        msg = f"""【[{chat_title}]({chat_link})】
 
 🔴🔴🔴 风险警示 🔴🔴🔴
 
@@ -730,16 +720,17 @@ async def check_and_alert(event):
 📌 检测来源：{trigger_source}"""
 
         if message_text and trigger_source == "消息内容":
-            alert_message += f"\n📝 触发消息：{message_text[:100]}"
+            msg += f"\n📝 触发消息：{message_text[:100]}"
         
-        if trigger_source == "群名":
-            alert_message += f"\n⚠️ 群名称包含敏感词，请特别注意！"
-        
-        # 发送警示
+        # 直接发送，不用 send_alert_with_mention
         target_chat_id = config.ALERT_FORWARD_CHAT_ID or config.FORWARD_CHAT_ID
-        await send_alert_with_mention(target_chat_id, alert_message)
+        await client.send_message(target_chat_id, msg, parse_mode="md")
         
-        logger.info(f"⚠️ 发送群组警示: {group_name} (来源: {trigger_source}, 触发词: {trigger_word})")
+        # 发送 @all 提醒
+        await asyncio.sleep(0.5)
+        await client.send_message(target_chat_id, "@all @all @all 请所有成员注意上方风险警示！")
+        
+        logger.info(f"⚠️ 发送群组警示: {group_name} (来源: {trigger_source})")
         return True
         
     except Exception as e:
