@@ -2,12 +2,19 @@
   "api_id": 17124507,
   "api_hash": "64fca6e2a6b1b4489388daddd5fbae7c",
   "forward_chat_id": -1003878983546,
+  "your_user_id": null,
   "sleep_start": 3,
   "sleep_end": 8,
   "debounce_time": 60,
   "cache_expire": 3600,
   "heartbeat_interval": 1800,
-  "white_keywords": ["入金金额", "银行卡号后四位"],
+  "auto_update_interval": 14400,
+  "enable_auto_update": true,
+  "update_branch": "main",
+  "white_keywords": [
+    "入金金额",
+    "银行卡号后四位"
+  ],
   "filter_keywords": [
     "精聊", "刷单", "大区", "泰铢", "仲裁", "卡主姓名", "入金金额", "香港", "股票", "换汇",
     "公检法", "通道", "源头", "进算", "拖算", "滲透", "哈萨克", "无视", "尼日"
@@ -33,7 +40,9 @@
     "欢迎来到", "大事件", "奢侈品", "珠宝", "海外粉", "一手", "168", "138", "营业",
     "赛车", "飞艇", "捡钱", "澳门"
   ],
-  "ad_keywords": ["买卖", "拉群", "招募", "代理", "广告", "推广", "加群", "扫码", "兼职"],
+  "ad_keywords": [
+    "买卖", "拉群", "招募", "代理", "广告", "推广", "加群", "扫码", "兼职"
+  ],
   "ad_patterns": [
     "t\\.me/",
     "telegram\\.me/",
