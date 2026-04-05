@@ -73,6 +73,8 @@
     "@\\w+",
     "https?://"
   ],
+  "mention_users": [
+  ],
   "filter_regexes": [
     "支付.*群",
     "换汇",
