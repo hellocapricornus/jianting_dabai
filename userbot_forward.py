@@ -279,16 +279,35 @@ class AlertManager:
         self.alerted_groups = {}
         self.cooldown = config.ALERT_COOLDOWN_MINUTES * 60
     
-    def should_alert(self, group_id, group_name, message_text):
+    def should_alert(self, group_id, group_name, message_text, check_group_name=False):
+        """
+        检查是否应该发送警示
+        - group_id: 群组ID
+        - group_name: 群组名称
+        - message_text: 消息内容
+        - check_group_name: 是否检查群名（群名扫描时设为True）
+        """
         if not config.ALERT_ENABLED:
             return False
         
-        text_lower = message_text.lower()
-        is_triggered = any(kw in text_lower for kw in config.TRIGGER_KEYWORDS)
+        is_triggered = False
+        
+        # 检查消息内容
+        if message_text:
+            text_lower = message_text.lower()
+            if any(kw in text_lower for kw in config.TRIGGER_KEYWORDS):
+                is_triggered = True
+        
+        # 检查群名（群名扫描或需要检查时）
+        if not is_triggered and check_group_name and group_name:
+            group_name_lower = group_name.lower()
+            if any(kw in group_name_lower for kw in config.TRIGGER_KEYWORDS):
+                is_triggered = True
         
         if not is_triggered:
             return False
         
+        # 检查冷却时间
         now = time.time()
         if group_id in self.alerted_groups:
             last_alert = self.alerted_groups[group_id]
@@ -455,7 +474,7 @@ async def scan_groups_for_alert():
                 
                 if triggered_keywords:
                     # 检查冷却时间
-                    if alert_manager.should_alert(group_id, group_name, ""):
+                    if alert_manager.should_alert(group_id, group_name, "", check_group_name=True):
                         alert_manager.record_alert(group_id)
                         alert_count += 1
                         
@@ -636,7 +655,7 @@ async def check_and_alert(event):
             return False
         
         # 检查冷却时间
-        if not alert_manager.should_alert(group_id, group_name, message_text):
+        if not alert_manager.should_alert(group_id, group_name, message_text, check_group_name=False):
             logger.debug(f"群组 {group_name} 在冷却期内，跳过警示")
             return False
         
