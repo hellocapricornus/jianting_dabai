@@ -4,13 +4,14 @@
 """
 Telegram 消息监听转发机器人
 功能：监听群组消息，根据关键词过滤后转发到指定群组
-支持：配置文件热重载、GitHub自动更新、模拟真人离线、群组警示
+支持：配置文件热重载、GitHub自动更新、模拟真人离线、群组警示、休眠状态提醒
 """
 
 from telethon import TelegramClient, events
 from telethon.errors import ChatRestrictedError, FloodWaitError
 from telethon.network.connection.tcpabridged import ConnectionTcpAbridged
 from telethon.utils import get_display_name
+from telethon import types
 import re
 import time
 import json
@@ -43,7 +44,7 @@ class Config:
     def __init__(self, config_path="config.json"):
         self.config_path = config_path
         self.last_load_time = 0
-        self.reload_interval = 60  # 60秒检查一次更新
+        self.reload_interval = 60
         self.load_config()
     
     def load_config(self):
@@ -88,7 +89,7 @@ class Config:
             filter_regexes = config.get("filter_regexes", [])
             self.FILTER_REGEX = [re.compile(p) for p in filter_regexes]
             
-            # ========= 新增：警示配置 =========
+            # 警示配置
             alert_config = config.get("alert_config", {})
             self.ALERT_ENABLED = alert_config.get("enabled", True)
             self.TRIGGER_KEYWORDS = [k.lower() for k in alert_config.get("trigger_keywords", ["暂停作业"])]
@@ -96,6 +97,9 @@ class Config:
             self.ALERT_MENTION_ALL = alert_config.get("mention_all", True)
             self.ALERT_COOLDOWN_MINUTES = alert_config.get("cooldown_minutes", 60)
             self.ALERT_FORWARD_CHAT_ID = alert_config.get("alert_forward_chat_id", self.FORWARD_CHAT_ID)
+            
+            # 休眠提醒配置
+            self.SLEEP_NOTIFY_ENABLED = config.get("sleep_notify_enabled", True)
             
             logger.info(f"✅ 配置文件加载成功: {self.config_path}")
             
@@ -124,6 +128,28 @@ def is_sleep_time():
         return config.SLEEP_START <= bj_hour < config.SLEEP_END
     else:
         return bj_hour >= config.SLEEP_START or bj_hour < config.SLEEP_END
+
+def get_sleep_remaining():
+    """获取距离退出休眠的剩余时间（分钟）"""
+    utc_hour = time.gmtime().tm_hour
+    bj_hour = (utc_hour + 8) % 24
+    
+    if config.SLEEP_START < config.SLEEP_END:
+        if bj_hour < config.SLEEP_START:
+            remaining = (config.SLEEP_START - bj_hour) * 60
+        elif bj_hour >= config.SLEEP_END:
+            remaining = (24 - bj_hour + config.SLEEP_START) * 60
+        else:
+            remaining = (config.SLEEP_END - bj_hour) * 60
+    else:
+        if bj_hour >= config.SLEEP_START:
+            remaining = (24 - bj_hour + config.SLEEP_END) * 60
+        elif bj_hour < config.SLEEP_END:
+            remaining = (config.SLEEP_END - bj_hour) * 60
+        else:
+            remaining = (config.SLEEP_START - bj_hour) * 60
+    
+    return max(0, remaining)
 
 # ========= 工具函数 =========
 def safe_markdown(text):
@@ -164,25 +190,20 @@ def is_block(text):
 def is_ad(text):
     """广告检查（优化版）"""
     text_lower = text.lower()
-    # 关键词检查
     if any(k in text_lower for k in config.AD_KEYWORDS):
         return True
-    # 正则检查（已预编译）
     return any(p.search(text) for p in config.AD_REGEX)
 
 def is_target(text):
     """目标关键词检查（优化版）"""
     text_lower = text.lower()
     
-    # 关键词检查
     if any(k in text_lower for k in config.FILTER_KEYWORDS):
         return True
     
-    # 国家检查
     if any(c in text_lower for c in config.COUNTRIES):
         return True
     
-    # 正则检查（已预编译）
     return any(p.search(text) for p in config.FILTER_REGEX)
 
 # ========= 优化后的防抖 =========
@@ -232,7 +253,6 @@ debounce_manager = DebounceManager()
 MARKED_FILE = "marked_users.json"
 
 def load_marked_users():
-    """加载标记用户"""
     try:
         with open(MARKED_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -243,7 +263,6 @@ def load_marked_users():
         return {}
 
 def save_marked_users(users):
-    """保存标记用户"""
     try:
         with open(MARKED_FILE, "w", encoding="utf-8") as f:
             json.dump(users, f, ensure_ascii=False, indent=2)
@@ -252,28 +271,24 @@ def save_marked_users(users):
 
 marked_users = load_marked_users()
 
-# ========= 新增：警示管理器类 =========
+# ========= 警示管理器类 =========
 class AlertManager:
     """群组警示管理器，防止重复警示"""
     
     def __init__(self):
-        self.alerted_groups = {}  # {group_id: last_alert_time}
+        self.alerted_groups = {}
         self.cooldown = config.ALERT_COOLDOWN_MINUTES * 60
     
     def should_alert(self, group_id, group_name, message_text):
-        """检查是否应该发送警示"""
-        # 检查功能是否启用
         if not config.ALERT_ENABLED:
             return False
         
-        # 检查消息中是否包含触发词
         text_lower = message_text.lower()
         is_triggered = any(kw in text_lower for kw in config.TRIGGER_KEYWORDS)
         
         if not is_triggered:
             return False
         
-        # 检查冷却时间
         now = time.time()
         if group_id in self.alerted_groups:
             last_alert = self.alerted_groups[group_id]
@@ -284,11 +299,9 @@ class AlertManager:
         return True
     
     def record_alert(self, group_id):
-        """记录警示时间"""
         self.alerted_groups[group_id] = time.time()
     
     def clean_expired(self):
-        """清理过期的警示记录"""
         now = time.time()
         expired = [gid for gid, last_time in self.alerted_groups.items() 
                    if now - last_time > self.cooldown * 2]
@@ -296,7 +309,6 @@ class AlertManager:
             del self.alerted_groups[gid]
     
     def get_stats(self):
-        """获取警示统计"""
         now = time.time()
         active = len([gid for gid, last_time in self.alerted_groups.items() 
                      if now - last_time < self.cooldown])
@@ -319,30 +331,27 @@ client = TelegramClient(
 message_counter = 0
 forward_counter = 0
 start_time = time.time()
+last_sleep_status = None
 
-# ========= 修复后的模拟真人离线 =========
+# ========= 模拟真人离线 =========
 async def simulate_human_offline():
-    """模拟真人离线状态（修复版）"""
+    """模拟真人离线状态"""
     logger.info("🟢 启动模拟在线/离线任务")
     
     while True:
         try:
-            # 休眠期间不执行
             if is_sleep_time():
                 await asyncio.sleep(300)
                 continue
             
-            # 在线时段
             online_time = random.randint(1800, 5400)
             logger.info(f"🟢 模拟在线 {online_time // 60} 分钟")
             await client(functions.account.UpdateStatusRequest(offline=False))
             await asyncio.sleep(online_time)
             
-            # 再次检查是否进入休眠时间
             if is_sleep_time():
                 continue
             
-            # 离线时段
             offline_time = random.randint(120, 360)
             logger.info(f"🔴 模拟离线 {offline_time // 60} 分钟")
             await client(functions.account.UpdateStatusRequest(offline=True))
@@ -369,13 +378,11 @@ async def github_auto_update():
         try:
             logger.info("🔍 检查 GitHub 更新")
             
-            # 获取当前分支
             branch = subprocess.check_output(
                 ["git", "rev-parse", "--abbrev-ref", "HEAD"],
                 text=True
             ).strip()
             
-            # 获取远程更新
             subprocess.run(
                 ["git", "fetch", "origin"],
                 stdout=subprocess.PIPE,
@@ -383,7 +390,6 @@ async def github_auto_update():
                 timeout=30
             )
             
-            # 比较版本
             local = subprocess.check_output(
                 ["git", "rev-parse", "HEAD"],
                 text=True
@@ -401,14 +407,12 @@ async def github_auto_update():
                     f"🚀 GitHub 发现新版本\n本地: {local[:7]}\n远程: {remote[:7]}\n开始自动更新"
                 )
                 
-                # 执行更新
                 subprocess.run(["git", "pull"], check=True)
                 
                 logger.info("♻️ 重启程序")
                 await client.send_message("me", "✅ 更新完成，正在重启...")
                 await asyncio.sleep(2)
                 
-                # 重启程序
                 os.execv(sys.executable, [sys.executable] + sys.argv)
             
         except Exception as e:
@@ -416,9 +420,9 @@ async def github_auto_update():
         
         await asyncio.sleep(config.AUTO_UPDATE_INTERVAL)
 
-# ========= 转发消息 =========
+# ========= 转发消息（使用内联按钮） =========
 async def forward_message(event, text):
-    """转发消息到目标群组"""
+    """转发消息到目标群组（使用内联按钮）"""
     global forward_counter
     
     try:
@@ -439,11 +443,11 @@ async def forward_message(event, text):
         
         sender_name = safe_markdown(get_display_name(sender))
         
-        # 发信人显示文本
+        # 发信人显示
         if sender.username:
-            sender_text = f"@{sender.username}"
+            sender_text = f"@{sender.username} (ID: {sender.id})"
         else:
-            sender_text = sender_name
+            sender_text = f"{sender_name} (ID: {sender.id})"
         
         # 标记信息
         remark = ""
@@ -452,7 +456,7 @@ async def forward_message(event, text):
         
         # 原文链接
         original_link = ""
-        if hasattr(event.message, 'id') and event.chat_id:
+        if hasattr(event.message, 'id') and event.message.id:
             chat_id_str = str(event.chat_id)
             if chat_id_str.startswith("-100"):
                 original_link = f"\n[查看原文](https://t.me/c/{chat_id_str[4:]}/{event.message.id})"
@@ -463,34 +467,27 @@ async def forward_message(event, text):
 发信人：{sender_text}
 内容：{text}{remark}{original_link}
 """
-        # ========= 创建内联按钮 =========
-        from telethon import types
-        
-        # 创建联系发信人的按钮
-        contact_button = types.KeyboardButtonUrl(
-            text="📞 点击联系发信人",
-            url=f"tg://user?id={sender.id}"
-        )
-        
-        # 如果有用户名，也可以添加一个备用按钮
-        buttons = [[contact_button]]
-        
-        if sender.username:
-            username_button = types.KeyboardButtonUrl(
-                text="🔗 通过用户名联系",
-                url=f"https://t.me/{sender.username}"
-            )
-            buttons.append([username_button])
         
         await asyncio.sleep(random.uniform(1, 3))
         
-        # 发送带按钮的消息
+        # 创建内联按钮
+        buttons = [
+            [
+                types.KeyboardButtonUrl("💬 联系发信人", f"tg://user?id={sender.id}"),
+            ]
+        ]
+        
+        if sender.username:
+            buttons[0].append(
+                types.KeyboardButtonUrl("🔗 通过用户名", f"https://t.me/{sender.username}")
+            )
+        
         await client.send_message(
             config.FORWARD_CHAT_ID,
             msg,
             parse_mode="md",
             link_preview=False,
-            buttons=buttons  # 添加内联按钮
+            buttons=buttons
         )
         
         forward_counter += 1
@@ -504,14 +501,12 @@ async def forward_message(event, text):
     except Exception as e:
         logger.error(f"转发失败: {e}")
 
-# ========= 新增：发送警示消息并@所有人 =========
+# ========= 发送警示消息 =========
 async def send_alert_with_mention(chat_id, message):
     """发送警示消息并@所有人"""
     try:
         if config.ALERT_MENTION_ALL:
-            # 尝试@所有人
             try:
-                # 方法1：使用 @all 标签
                 message_with_mention = f"@all {message}"
                 await client.send_message(chat_id, message_with_mention)
                 logger.info(f"已发送警示消息（含@all）到 {chat_id}")
@@ -525,19 +520,15 @@ async def send_alert_with_mention(chat_id, message):
     except Exception as e:
         logger.error(f"发送警示消息失败: {e}")
 
-# ========= 新增：检测群组是否暂停作业并发送警示 =========
+# ========= 检测群组警示 =========
 async def check_and_alert(event):
     """检测群组是否暂停作业并发送警示"""
     try:
-        # 获取群组信息
         chat = await event.get_chat()
         group_name = getattr(chat, "title", "未知群组")
         group_id = event.chat_id
-        
-        # 获取消息内容
         message_text = event.message.message if event.message else ""
         
-        # 检查是否需要警示
         should_alert = False
         trigger_word = ""
         
@@ -561,14 +552,11 @@ async def check_and_alert(event):
         if not should_alert:
             return False
         
-        # 检查冷却时间
         if not alert_manager.should_alert(group_id, group_name, message_text):
             return False
         
-        # 记录警示
         alert_manager.record_alert(group_id)
         
-        # 构建警示消息
         alert_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         alert_message = config.ALERT_MESSAGE.format(
             group_name=group_name,
@@ -576,17 +564,13 @@ async def check_and_alert(event):
             trigger_word=trigger_word
         )
         
-        # 添加消息来源信息
         if message_text:
             alert_message += f"\n\n📝 触发消息：{message_text[:100]}"
         
-        # 发送警示到配置的群组
         target_chat_id = config.ALERT_FORWARD_CHAT_ID or config.FORWARD_CHAT_ID
         
-        # 发送警示消息
         await send_alert_with_mention(target_chat_id, alert_message)
         
-        # 同时发送给机器人主人
         try:
             await client.send_message("me", f"🔔 群组警示\n\n群组：{group_name}\n触发词：{trigger_word}\n时间：{alert_time}")
         except:
@@ -599,342 +583,116 @@ async def check_and_alert(event):
         logger.error(f"check_and_alert 异常: {e}")
         return False
 
-# ========= 私聊命令（带权限验证） =========
-async def init_user_id():
-    """初始化你的用户ID"""
-    global YOUR_USER_ID
-    me = await client.get_me()
-    YOUR_USER_ID = me.id
+# ========= 休眠状态监控 =========
+async def sleep_status_monitor():
+    """监控休眠状态变化，进入/退出休眠时发送提醒"""
+    global last_sleep_status
     
-    # 如果配置文件中没有设置，自动设置
-    if config.YOUR_USER_ID is None:
-        logger.info(f"⚠️ 配置文件中未设置your_user_id，自动设置为: {YOUR_USER_ID}")
-        config.YOUR_USER_ID = YOUR_USER_ID
+    await asyncio.sleep(10)
     
-    logger.info(f"✅ 当前用户ID: {YOUR_USER_ID}")
+    while True:
+        try:
+            current_status = is_sleep_time()
+            
+            if last_sleep_status is not None and last_sleep_status != current_status:
+                if current_status:
+                    # 进入休眠
+                    remaining_minutes = get_sleep_remaining()
+                    msg = f"""🌙 **进入休眠模式**
 
-def is_owner(event):
-    """检查是否为机器人主人"""
-    return event.sender_id == config.YOUR_USER_ID
+时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+状态: 机器人已进入夜间休眠
+操作: 停止监听和转发消息
 
-@client.on(events.NewMessage(pattern=r'^/mark_id (\d+) (.+)'))
-async def mark_user(event):
-    """标记用户（仅自己可用）"""
-    if not event.is_private:
-        return
-    if not is_owner(event):
-        await event.reply("❌ 权限不足，只有机器人主人可以使用此命令")
-        return
-    
-    uid, remark = event.pattern_match.groups()
-    marked_users[str(uid)] = remark
-    save_marked_users(marked_users)
-    
-    await event.reply(f"✅ 标记成功\n{uid} → {remark}")
-    logger.info(f"标记用户: {uid} -> {remark}")
+预计唤醒: {config.SLEEP_END}:00
+剩余时间: {remaining_minutes // 60}小时 {remaining_minutes % 60}分钟
 
-@client.on(events.NewMessage(pattern=r'^/unmark_id (\d+)'))
-async def unmark_user(event):
-    """取消标记（仅自己可用）"""
-    if not event.is_private:
-        return
-    if not is_owner(event):
-        await event.reply("❌ 权限不足，只有机器人主人可以使用此命令")
-        return
-    
-    uid = event.pattern_match.group(1)
-    
-    if uid in marked_users:
-        del marked_users[uid]
-        save_marked_users(marked_users)
-        await event.reply(f"❌ 已删除标记: {uid}")
-        logger.info(f"取消标记: {uid}")
-    else:
-        await event.reply("❌ 未找到该用户标记")
+💡 此期间不会发送任何消息通知
+"""
+                    await client.send_message("me", msg)
+                    logger.info("🌙 进入休眠模式")
+                else:
+                    # 退出休眠
+                    msg = f"""☀️ **退出休眠模式**
 
-@client.on(events.NewMessage(pattern=r'^/stats$'))
-async def show_stats(event):
-    """显示统计信息（仅自己可用）"""
-    if not event.is_private:
-        return
-    if not is_owner(event):
-        return
-    
+时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+状态: 机器人已恢复运行
+操作: 开始监听和转发消息
+
+下次休眠: {config.SLEEP_START}:00
+
+✅ 机器人已恢复正常工作
+"""
+                    await client.send_message("me", msg)
+                    logger.info("☀️ 退出休眠模式")
+            
+            last_sleep_status = current_status
+            
+        except Exception as e:
+            logger.error(f"休眠状态监控异常: {e}")
+        
+        await asyncio.sleep(60)
+
+# ========= 心跳检测 =========
+async def heartbeat():
+    """心跳检测 - 定期发送状态给自己"""
     global message_counter, forward_counter, start_time
     
-    uptime = int(time.time() - start_time)
-    cache_stats = debounce_manager.get_stats()
-    alert_stats = alert_manager.get_stats()
+    await asyncio.sleep(30)
     
-    stats = f"""📊 机器人统计
+    while True:
+        try:
+            uptime = int(time.time() - start_time)
+            is_sleep = is_sleep_time()
+            
+            if is_sleep:
+                remaining = get_sleep_remaining()
+                status = "🌙 夜间休眠中"
+                msg = f"""🌙 **休眠中心跳**
 
-📈 监听消息: {message_counter}
-📤 转发消息: {forward_counter}
-📊 转发率: {(forward_counter/message_counter*100):.1f}%  (如果有消息)
-⏱️ 运行时间: {uptime // 3600}小时 {(uptime % 3600) // 60}分钟
+**状态:** {status}
+**运行时间:** {uptime // 3600}小时 {(uptime % 3600) // 60}分钟
+**预计唤醒:** {config.SLEEP_END}:00
+**剩余时间:** {remaining // 60}小时 {remaining % 60}分钟
 
-💾 缓存统计:
-   - 缓存大小: {cache_stats['size']}
-   - 命中次数: {cache_stats['hits']}
-   - 未命中: {cache_stats['misses']}
-   - 命中率: {(cache_stats['hits']/(cache_stats['hits']+cache_stats['misses'])*100):.1f}%  (如果有数据)
-
-🔔 警示统计:
-   - 功能状态: {'启用' if config.ALERT_ENABLED else '禁用'}
-   - 触发关键词: {', '.join(config.TRIGGER_KEYWORDS)}
-   - 冷却时间: {config.ALERT_COOLDOWN_MINUTES}分钟
-   - 警示记录: {alert_stats['total']}个群组
-
-🔧 配置信息:
-   - 转发群组: {config.FORWARD_CHAT_ID}
-   - 休眠时间: {config.SLEEP_START}:00 - {config.SLEEP_END}:00
-   - 自动更新: {'开启' if config.ENABLE_AUTO_UPDATE else '关闭'}
+💡 此期间不监听和转发消息
 """
-    
-    await event.reply(stats)
+                sleep_interval = 7200  # 休眠时2小时一次
+            else:
+                status = "🟢 正常运行"
+                msg = f"""💓 **心跳检测** [{datetime.now().strftime('%H:%M:%S')}]
 
-@client.on(events.NewMessage(pattern=r'^/reload$'))
-async def reload_config(event):
-    """重载配置（仅自己可用）"""
-    if not event.is_private:
-        return
-    if not is_owner(event):
-        return
-    
-    try:
-        config.load_config()
-        # 更新警示管理器的冷却时间
-        alert_manager.cooldown = config.ALERT_COOLDOWN_MINUTES * 60
-        await event.reply("✅ 配置重载成功")
-        logger.info("配置重载成功")
-    except Exception as e:
-        await event.reply(f"❌ 配置重载失败: {e}")
-        logger.error(f"配置重载失败: {e}")
-
-@client.on(events.NewMessage(pattern=r'^/update$'))
-async def force_update(event):
-    """手动触发GitHub更新（仅自己可用）"""
-    if not event.is_private:
-        return
-    if not is_owner(event):
-        await event.reply("❌ 权限不足，只有机器人主人可以使用此命令")
-        return
-    
-    await event.reply("🔄 正在检查更新...")
-    logger.info("手动触发更新检查")
-    
-    try:
-        if not os.path.isdir(".git"):
-            await event.reply("❌ 当前不是Git仓库，无法自动更新")
-            return
-        
-        # 获取当前分支
-        branch = subprocess.check_output(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            text=True
-        ).strip()
-        
-        # 获取远程更新
-        subprocess.run(
-            ["git", "fetch", "origin"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=30
-        )
-        
-        # 比较版本
-        local = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            text=True
-        ).strip()
-        
-        remote = subprocess.check_output(
-            ["git", "rev-parse", f"origin/{branch}"],
-            text=True
-        ).strip()
-        
-        if local != remote:
-            await event.reply(f"🚀 发现新版本\n本地: {local[:7]}\n远程: {remote[:7]}\n开始自动更新...")
-            logger.info(f"发现新版本，开始更新: {local[:7]} -> {remote[:7]}")
+**状态:** {status}
+**监听消息:** {message_counter}
+**转发消息:** {forward_counter}
+**运行时间:** {uptime // 3600}小时 {(uptime % 3600) // 60}分钟
+**缓存大小:** {debounce_manager.get_size()}
+**警示记录:** {alert_manager.get_stats()['total']}个群组
+"""
+                sleep_interval = config.HEARTBEAT_INTERVAL
             
-            # 执行更新
-            subprocess.run(["git", "pull"], check=True)
+            await client.send_message("me", msg, parse_mode="md")
+            logger.info(f"💓 心跳已发送 - 状态: {status}")
             
-            await event.reply("✅ 更新完成，3秒后重启...")
-            await asyncio.sleep(3)
-            
-            # 重启程序
-            os.execv(sys.executable, [sys.executable] + sys.argv)
+        except FloodWaitError as e:
+            logger.warning(f"心跳被限制，等待 {e.seconds} 秒")
+            await asyncio.sleep(e.seconds)
+        except Exception as e:
+            logger.error(f"心跳发送失败: {e}")
+        
+        if is_sleep_time():
+            await asyncio.sleep(7200)
         else:
-            await event.reply(f"✅ 已是最新版本\n当前版本: {local[:7]}")
-            
-    except Exception as e:
-        await event.reply(f"❌ 更新失败: {e}")
-        logger.error(f"更新失败: {e}")
+            await asyncio.sleep(config.HEARTBEAT_INTERVAL)
 
-# ========= 新增：警示统计命令 =========
-@client.on(events.NewMessage(pattern=r'^/alert_stats$'))
-async def show_alert_stats(event):
-    """显示警示统计（仅自己可用）"""
-    if not event.is_private:
-        return
-    if not is_owner(event):
-        return
-    
-    alert_stats = alert_manager.get_stats()
-    
-    stats = f"""🔔 警示系统统计
-
-📊 功能状态: {'✅ 启用' if config.ALERT_ENABLED else '❌ 禁用'}
-🔑 触发关键词: {', '.join(config.TRIGGER_KEYWORDS)}
-⏰ 冷却时间: {config.ALERT_COOLDOWN_MINUTES} 分钟
-📝 历史警示群组: {alert_stats['total']} 个
-🟢 冷却中群组: {alert_stats['active']} 个
-
-💡 当群名或消息包含触发关键词时，会自动发送警示并@所有人
-"""
-    
-    await event.reply(stats)
-
-# ========= 新增：手动触发警示命令 =========
-@client.on(events.NewMessage(pattern=r'^/alert_group (.+)'))
-async def manual_alert(event):
-    """手动触发群组警示（仅自己可用）"""
-    if not event.is_private:
-        return
-    if not is_owner(event):
-        await event.reply("❌ 权限不足")
-        return
-    
-    group_name = event.pattern_match.group(1)
-    
-    alert_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    alert_message = config.ALERT_MESSAGE.format(
-        group_name=group_name,
-        time=alert_time,
-        trigger_word="手动触发"
-    )
-    
-    target_chat_id = config.ALERT_FORWARD_CHAT_ID or config.FORWARD_CHAT_ID
-    await send_alert_with_mention(target_chat_id, alert_message)
-    
-    await event.reply(f"✅ 已发送警示消息到群组\n群组：{group_name}")
-
-@client.on(events.NewMessage(pattern=r'^/help$'))
-async def show_help(event):
-    """显示帮助信息（仅自己可用）"""
-    if not event.is_private:
-        return
-    if not is_owner(event):
-        return
-    
-    help_text = """🤖 **机器人命令帮助**
-
-**管理命令：**
-• `/stats` - 查看统计信息
-• `/reload` - 重载配置文件
-• `/update` - 手动检查并更新代码
-• `/help` - 显示此帮助
-
-**标记命令：**
-• `/mark_id <用户ID> <备注>` - 标记用户
-• `/unmark_id <用户ID>` - 取消标记
-
-**警示命令：**
-• `/alert_stats` - 查看警示系统统计
-• `/alert_group <群组名>` - 手动发送群组警示
-
-**警示功能说明：**
-• 自动检测群名或消息中的暂停作业关键词
-• 检测到后自动发送警示消息到指定群组
-• 支持@所有人提醒（需要管理员权限）
-• 每个群组有冷却时间，避免重复警示
-
-**功能说明：**
-• 自动监听群组消息
-• 根据关键词过滤转发
-• 支持配置文件热重载
-• 支持GitHub自动更新
-• 模拟真人在线/离线状态
-
-**配置文件：** `config.json`
-**日志文件：** `bot.log`
-"""
-    
-    await event.reply(help_text, parse_mode="md")
-
-# ========= 主监听 =========
-@client.on(events.NewMessage)
-async def handler(event):
-    """主监听：优化过滤顺序，白名单优先转发"""
-    # 休眠检查
-    if is_sleep_time():
-        return
-    
-    global message_counter
-    
-    try:
-        # 基础过滤
-        if not (event.is_group or event.is_channel):
-            return
-        if event.chat_id == config.FORWARD_CHAT_ID:
-            return
-        if not event.message or not event.message.message:
-            return
-        
-        text = event.message.message.strip()
-        if not text:
-            return
-        
-        # ========= 新增：群组警示检测（优先执行） =========
-        await check_and_alert(event)
-        
-        message_counter += 1
-        
-        # 定期清理缓存和重载配置
-        if message_counter % 100 == 0:
-            debounce_manager.clean_expired()
-            alert_manager.clean_expired()
-            if config.check_reload():
-                logger.info("配置已热重载")
-        
-        # —— 高效过滤：先屏蔽广告与垃圾信息 —— #
-        if is_block(text):
-            return
-        if is_ad(text):
-            return
-        
-        # —— 白名单强制转发 —— #
-        if is_white(text):
-            await forward_message(event, text)
-            return
-        
-        # —— 关键词 / 国家过滤 —— #
-        if not is_target(text):
-            return
-        
-        # —— 长度限制（超过则截断） —— #
-        if len(text) > 300:
-            text = text[:297] + "..."
-        
-        # —— 防抖 —— #
-        if debounce_manager.is_duplicate(text):
-            return
-        
-        # 满足条件，转发
-        await forward_message(event, text)
-        
-    except Exception as e:
-        logger.error(f"handler异常: {e}")
-
-# ========= 日报 =========
+# ========= 每日报告 =========
 async def daily_report():
     """每日报告"""
     global message_counter, forward_counter, start_time
     
     while True:
         try:
-            await asyncio.sleep(86400)  # 24小时
+            await asyncio.sleep(86400)
             
             uptime = int(time.time() - start_time)
             cache_stats = debounce_manager.get_stats()
@@ -967,45 +725,345 @@ async def daily_report():
         except Exception as e:
             logger.error(f"daily_report 异常: {e}")
 
-# ========= 心跳 =========
-async def heartbeat():
-    """心跳检测"""
-    global message_counter, forward_counter, start_time
-    
-    while True:
-        try:
-            await asyncio.sleep(config.HEARTBEAT_INTERVAL)
-            
-            uptime = int(time.time() - start_time)
-            
-            if is_sleep_time():
-                status = "🌙 夜间休眠"
-            else:
-                status = "🟢 运行中"
-            
-            msg = f"""💓 心跳检测 [{datetime.now().strftime('%H:%M:%S')}]
-
-状态: {status}
-监听消息: {message_counter}
-转发消息: {forward_counter}
-运行时间: {uptime // 3600}小时 {(uptime % 3600) // 60}分钟
-缓存大小: {debounce_manager.get_size()}
-警示记录: {len(alert_manager.alerted_groups)}个群组
-"""
-            
-            await client.send_message("me", msg)
-            logger.debug("心跳已发送")
-            
-        except Exception as e:
-            logger.error(f"心跳发送失败: {e}")
-
-# ========= 新增：定时清理警示缓存 =========
+# ========= 定时清理 =========
 async def alert_cache_cleaner():
     """定时清理警示缓存"""
     while True:
-        await asyncio.sleep(3600)  # 每小时清理一次
+        await asyncio.sleep(3600)
         alert_manager.clean_expired()
         logger.debug("警示缓存已清理")
+
+# ========= 私聊命令 =========
+async def init_user_id():
+    """初始化你的用户ID"""
+    global YOUR_USER_ID
+    me = await client.get_me()
+    YOUR_USER_ID = me.id
+    
+    if config.YOUR_USER_ID is None or config.YOUR_USER_ID != YOUR_USER_ID:
+        logger.info(f"⚠️ 自动设置用户ID为: {YOUR_USER_ID}")
+        try:
+            with open("config.json", "r", encoding="utf-8") as f:
+                config_data = json.load(f)
+            config_data["your_user_id"] = YOUR_USER_ID
+            config.YOUR_USER_ID = YOUR_USER_ID
+            with open("config.json", "w", encoding="utf-8") as f:
+                json.dump(config_data, f, ensure_ascii=False, indent=2)
+            logger.info(f"✅ 用户ID已保存到配置文件: {YOUR_USER_ID}")
+        except Exception as e:
+            logger.error(f"保存用户ID失败: {e}")
+    
+    logger.info(f"✅ 当前用户ID: {YOUR_USER_ID}")
+
+def is_owner(event):
+    return event.sender_id == config.YOUR_USER_ID
+
+@client.on(events.NewMessage(pattern=r'^/mark_id (\d+) (.+)'))
+async def mark_user(event):
+    if not event.is_private or not is_owner(event):
+        return
+    uid, remark = event.pattern_match.groups()
+    marked_users[str(uid)] = remark
+    save_marked_users(marked_users)
+    await event.reply(f"✅ 标记成功\n{uid} → {remark}")
+
+@client.on(events.NewMessage(pattern=r'^/unmark_id (\d+)'))
+async def unmark_user(event):
+    if not event.is_private or not is_owner(event):
+        return
+    uid = event.pattern_match.group(1)
+    if uid in marked_users:
+        del marked_users[uid]
+        save_marked_users(marked_users)
+        await event.reply(f"❌ 已删除标记: {uid}")
+
+@client.on(events.NewMessage(pattern=r'^/stats$'))
+async def show_stats(event):
+    if not event.is_private or not is_owner(event):
+        return
+    
+    global message_counter, forward_counter, start_time
+    
+    uptime = int(time.time() - start_time)
+    cache_stats = debounce_manager.get_stats()
+    alert_stats = alert_manager.get_stats()
+    
+    stats = f"""📊 **机器人统计**
+
+📈 监听消息: `{message_counter}`
+📤 转发消息: `{forward_counter}`
+📊 转发率: `{(forward_counter/message_counter*100):.1f}%`
+⏱️ 运行时间: `{uptime // 3600}`小时 `{(uptime % 3600) // 60}`分钟
+
+💾 缓存统计:
+   - 缓存大小: `{cache_stats['size']}`
+   - 命中次数: `{cache_stats['hits']}`
+   - 未命中: `{cache_stats['misses']}`
+
+🔔 警示统计:
+   - 功能状态: `{'启用' if config.ALERT_ENABLED else '禁用'}`
+   - 触发关键词: `{', '.join(config.TRIGGER_KEYWORDS)}`
+   - 警示记录: `{alert_stats['total']}`个群组
+
+🔧 配置:
+   - 休眠时间: `{config.SLEEP_START}:00 - {config.SLEEP_END}:00`
+   - 自动更新: `{'开启' if config.ENABLE_AUTO_UPDATE else '关闭'}`
+"""
+    
+    await event.reply(stats, parse_mode="md")
+
+@client.on(events.NewMessage(pattern=r'^/reload$'))
+async def reload_config(event):
+    if not event.is_private or not is_owner(event):
+        return
+    try:
+        config.load_config()
+        alert_manager.cooldown = config.ALERT_COOLDOWN_MINUTES * 60
+        await event.reply("✅ 配置重载成功")
+        logger.info("配置重载成功")
+    except Exception as e:
+        await event.reply(f"❌ 配置重载失败: {e}")
+
+@client.on(events.NewMessage(pattern=r'^/update$'))
+async def force_update(event):
+    if not event.is_private or not is_owner(event):
+        return
+    
+    await event.reply("🔄 正在检查更新...")
+    
+    try:
+        if not os.path.isdir(".git"):
+            await event.reply("❌ 当前不是Git仓库")
+            return
+        
+        branch = subprocess.check_output(["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True).strip()
+        subprocess.run(["git", "fetch", "origin"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        local = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+        remote = subprocess.check_output(["git", "rev-parse", f"origin/{branch}"], text=True).strip()
+        
+        if local != remote:
+            await event.reply(f"🚀 发现新版本\n本地: {local[:7]}\n远程: {remote[:7]}\n开始更新...")
+            subprocess.run(["git", "pull"], check=True)
+            await event.reply("✅ 更新完成，3秒后重启...")
+            await asyncio.sleep(3)
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        else:
+            await event.reply(f"✅ 已是最新版本\n当前版本: {local[:7]}")
+            
+    except Exception as e:
+        await event.reply(f"❌ 更新失败: {e}")
+
+@client.on(events.NewMessage(pattern=r'^/alert_stats$'))
+async def show_alert_stats(event):
+    if not event.is_private or not is_owner(event):
+        return
+    
+    alert_stats = alert_manager.get_stats()
+    
+    stats = f"""🔔 **警示系统统计**
+
+📊 功能状态: `{'✅ 启用' if config.ALERT_ENABLED else '❌ 禁用'}`
+🔑 触发关键词: `{', '.join(config.TRIGGER_KEYWORDS)}`
+⏰ 冷却时间: `{config.ALERT_COOLDOWN_MINUTES}` 分钟
+📝 历史警示群组: `{alert_stats['total']}` 个
+🟢 冷却中群组: `{alert_stats['active']}` 个
+
+💡 当群名或消息包含触发关键词时，会自动发送警示
+"""
+    
+    await event.reply(stats, parse_mode="md")
+
+@client.on(events.NewMessage(pattern=r'^/alert_group (.+)'))
+async def manual_alert(event):
+    if not event.is_private or not is_owner(event):
+        return
+    
+    group_name = event.pattern_match.group(1)
+    alert_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    alert_message = config.ALERT_MESSAGE.format(
+        group_name=group_name,
+        time=alert_time,
+        trigger_word="手动触发"
+    )
+    
+    target_chat_id = config.ALERT_FORWARD_CHAT_ID or config.FORWARD_CHAT_ID
+    await send_alert_with_mention(target_chat_id, alert_message)
+    await event.reply(f"✅ 已发送警示消息\n群组：{group_name}")
+
+@client.on(events.NewMessage(pattern=r'^/sleep$'))
+async def check_sleep_status(event):
+    """查询当前休眠状态"""
+    if not event.is_private or not is_owner(event):
+        return
+    
+    is_sleep = is_sleep_time()
+    
+    if is_sleep:
+        remaining = get_sleep_remaining()
+        msg = f"""🌙 **当前状态: 休眠模式**
+
+**进入时间:** {config.SLEEP_START}:00
+**退出时间:** {config.SLEEP_END}:00
+**剩余时间:** {remaining // 60}小时 {remaining % 60}分钟
+
+⚠️ 当前不监听和转发消息
+"""
+    else:
+        msg = f"""🟢 **当前状态: 运行模式**
+
+**运行时间:** {config.SLEEP_END}:00 - {config.SLEEP_START}:00
+**下次休眠:** {config.SLEEP_START}:00
+
+✅ 正常监听和转发消息
+"""
+    
+    await event.reply(msg)
+
+@client.on(events.NewMessage(pattern=r'^/ping$'))
+async def ping_command(event):
+    """测试机器人是否在线"""
+    if not event.is_private or not is_owner(event):
+        return
+    
+    start = time.time()
+    await event.reply("🏓 Pong!")
+    end = time.time()
+    
+    latency = (end - start) * 1000
+    await event.reply(f"✅ 机器人在线\n延迟: {latency:.0f}ms")
+
+@client.on(events.NewMessage(pattern=r'^/status$'))
+async def status_command(event):
+    """查看机器人详细状态"""
+    if not event.is_private or not is_owner(event):
+        return
+    
+    global message_counter, forward_counter, start_time
+    
+    uptime = int(time.time() - start_time)
+    days = uptime // 86400
+    hours = (uptime % 86400) // 3600
+    minutes = (uptime % 3600) // 60
+    
+    is_connected = client.is_connected()
+    is_sleep = is_sleep_time()
+    
+    status_msg = f"""📊 **机器人状态报告**
+
+**连接状态:** `{'✅ 已连接' if is_connected else '❌ 断开连接'}`
+**工作状态:** `{'🌙 休眠中' if is_sleep else '🟢 运行中'}`
+**运行时长:** `{days}`天 `{hours}`小时 `{minutes}`分钟
+
+**统计数据:**
+- 监听消息: `{message_counter}`
+- 转发消息: `{forward_counter}`
+- 转发率: `{(forward_counter/message_counter*100):.1f}%`
+
+**系统状态:**
+- 缓存大小: `{debounce_manager.get_size()}`
+- 警示记录: `{alert_manager.get_stats()['total']}`个
+- 自动更新: `{'开启' if config.ENABLE_AUTO_UPDATE else '关闭'}`
+
+**配置信息:**
+- 转发群组: `{config.FORWARD_CHAT_ID}`
+- 心跳间隔: `{config.HEARTBEAT_INTERVAL // 60}`分钟
+- 休眠时段: `{config.SLEEP_START}:00 - {config.SLEEP_END}:00`
+"""
+    
+    await event.reply(status_msg, parse_mode="md")
+
+@client.on(events.NewMessage(pattern=r'^/help$'))
+async def show_help(event):
+    if not event.is_private or not is_owner(event):
+        return
+    
+    help_text = """🤖 **机器人命令帮助**
+
+**📊 查看命令：**
+• `/stats` - 查看统计信息
+• `/status` - 查看详细状态
+• `/sleep` - 查看休眠状态
+• `/ping` - 测试机器人是否在线
+• `/alert_stats` - 查看警示系统统计
+
+**⚙️ 管理命令：**
+• `/reload` - 重载配置文件
+• `/update` - 手动检查并更新代码
+• `/help` - 显示此帮助
+
+**🏷️ 标记命令：**
+• `/mark_id <用户ID> <备注>` - 标记用户
+• `/unmark_id <用户ID>` - 取消标记
+
+**🔔 警示命令：**
+• `/alert_group <群组名>` - 手动发送群组警示
+
+**💡 功能说明：**
+• 自动检测群组暂停作业并发送警示
+• 进入/退出休眠时会自动通知
+• 支持配置文件热重载
+• 支持GitHub自动更新
+• 模拟真人在线/离线状态
+
+**配置文件：** `config.json`
+**日志文件：** `bot.log`
+"""
+    
+    await event.reply(help_text, parse_mode="md")
+
+# ========= 主监听 =========
+@client.on(events.NewMessage)
+async def handler(event):
+    """主监听"""
+    if is_sleep_time():
+        return
+    
+    global message_counter
+    
+    try:
+        if not (event.is_group or event.is_channel):
+            return
+        if event.chat_id == config.FORWARD_CHAT_ID:
+            return
+        if not event.message or not event.message.message:
+            return
+        
+        text = event.message.message.strip()
+        if not text:
+            return
+        
+        await check_and_alert(event)
+        
+        message_counter += 1
+        
+        if message_counter % 100 == 0:
+            debounce_manager.clean_expired()
+            alert_manager.clean_expired()
+            if config.check_reload():
+                logger.info("配置已热重载")
+        
+        if is_block(text):
+            return
+        if is_ad(text):
+            return
+        
+        if is_white(text):
+            await forward_message(event, text)
+            return
+        
+        if not is_target(text):
+            return
+        
+        if len(text) > 300:
+            text = text[:297] + "..."
+        
+        if debounce_manager.is_duplicate(text):
+            return
+        
+        await forward_message(event, text)
+        
+    except Exception as e:
+        logger.error(f"handler异常: {e}")
 
 # ========= 主函数 =========
 async def main():
@@ -1015,7 +1073,6 @@ async def main():
             await client.start()
             await client.get_dialogs()
             
-            # 初始化用户ID
             await init_user_id()
             
             logger.info("✅ 机器人启动成功")
@@ -1027,7 +1084,8 @@ async def main():
                 asyncio.create_task(daily_report()),
                 asyncio.create_task(github_auto_update()),
                 asyncio.create_task(simulate_human_offline()),
-                asyncio.create_task(alert_cache_cleaner()),  # 新增
+                asyncio.create_task(alert_cache_cleaner()),
+                asyncio.create_task(sleep_status_monitor()),
             ]
             
             await client.run_until_disconnected()
