@@ -5,6 +5,8 @@
   "your_user_id": 7596698993,
   "sleep_start": 3,
   "sleep_end": 8,
+  "sleep_notify_enabled": true,
+  "heartbeat_interval": 1800,
   "debounce_time": 60,
   "cache_expire": 3600,
   "heartbeat_interval": 1800,
