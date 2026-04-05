@@ -60,7 +60,7 @@
   "alert_config": {
     "enabled": true,
     "trigger_keywords": ["暂停作业", "停止作业", "暂停接单", "担保关闭", "停止接单"],
-    "alert_message": "⚠️ 风险警示\n\n群组【{group_name}】已暂停作业！\n\n请谨慎交易，注意资金安全！\n\n时间：{time}",
+    "alert_message": "⚠️ 风险警示\n\n【{group_name}】已暂停作业！\n\n请谨慎交易，注意资金安全！\n\n时间：{time}",
     "mention_all": true,
     "cooldown_minutes": 60,
     "alert_forward_chat_id": null
