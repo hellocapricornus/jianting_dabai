@@ -602,25 +602,27 @@ async def forward_message(event, text):
 
 # ========= 发送警示消息 =========
 async def send_alert_with_mention(chat_id, message):
-    """发送警示消息（分步发送，确保可靠）"""
+    """发送警示消息（确保按钮显示）"""
     try:
         from telethon import types
         
-        # 第一步：发送警示文字
+        # 第一步：发送警示文字（不带按钮）
         alert_header = "🔴🔴🔴 风险警示 🔴🔴🔴\n\n"
         full_message = f"{alert_header}{message}\n\n@all @all @all"
         
         await client.send_message(chat_id, full_message)
         
-        # 第二步：发送带按钮的消息
+        # 第二步：单独发送按钮消息
+        # 注意：按钮消息只能包含按钮，文字要分开
         buttons = [
-            [types.KeyboardButtonUrl("⚠️ 我已了解风险", "https://t.me/telegram")],
+            [types.KeyboardButtonUrl("⚠️ 点击了解风险", "https://t.me/telegram")],
             [types.KeyboardButtonUrl("📞 联系管理员", f"tg://user?id={config.YOUR_USER_ID}")]
         ]
         
+        # 发送带按钮的消息（文字简短）
         await client.send_message(
             chat_id,
-            "⚠️ 请点击下方按钮确认或联系管理员：",
+            "📢 请点击下方按钮：",
             buttons=buttons
         )
         
@@ -632,11 +634,11 @@ async def send_alert_with_mention(chat_id, message):
         
     except Exception as e:
         logger.error(f"发送警示消息失败: {e}")
+        # 降级：普通消息
         try:
             await client.send_message(chat_id, f"🔴🔴🔴 风险警示 🔴🔴🔴\n\n{message}")
         except:
             pass
-
 # ========= 检测群组警示 =========
 async def check_and_alert(event):
     """检测群组是否暂停作业并发送警示（增强版）"""
