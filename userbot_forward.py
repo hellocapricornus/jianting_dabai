@@ -606,11 +606,14 @@ async def send_alert_with_mention(chat_id, message):
     try:
         from telethon import types
         
+        # 创建可点击的 @所有人 链接（HTML格式）
+        mention_html = '<a href="tg://mention">所有人</a>'
+        
         # 添加醒目标记
         alert_header = "🔴🔴🔴 风险警示 🔴🔴🔴\n\n"
-        all_mentions = "@所有人 @所有人 @所有人\n\n"
         
-        full_message = f"{all_mentions}{alert_header}{message}"
+        # 构建完整消息：3个可点击的@所有人 + 警示内容
+        full_message = f"{mention_html} {mention_html} {mention_html}\n\n{alert_header}{message}"
         
         # 创建内联按钮
         buttons = [
@@ -618,10 +621,11 @@ async def send_alert_with_mention(chat_id, message):
             [types.KeyboardButtonUrl("📞 联系管理员", f"tg://user?id={config.YOUR_USER_ID}")]
         ]
         
-        # 发送第一条：文字 + 按钮
+        # 发送第一条：文字 + 按钮（使用 html 解析模式）
         await client.send_message(
             chat_id,
             full_message,
+            parse_mode='html',  # 关键：必须使用 html 模式
             buttons=buttons
         )
         
@@ -629,7 +633,7 @@ async def send_alert_with_mention(chat_id, message):
         await asyncio.sleep(1)
         await client.send_message(chat_id, "⚠️ 请所有成员注意上方风险警示！")
         
-        logger.info(f"已发送警示消息到 {chat_id}")
+        logger.info(f"已发送警示消息（@所有人 HTML方式）到 {chat_id}")
         
     except Exception as e:
         logger.error(f"发送警示消息失败: {e}")
