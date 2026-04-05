@@ -439,111 +439,6 @@ async def github_auto_update():
         
         await asyncio.sleep(config.AUTO_UPDATE_INTERVAL)
 
-# ========= 定时扫描群组，检测群名是否包含警示词 =========
-async def scan_groups_for_alert():
-    """定时扫描所有群组，检测群名是否包含警示关键词"""
-    if not config.ALERT_ENABLED:
-        return
-    
-    logger.info("🔍 开始扫描群组，检测群名是否包含警示词...")
-    
-    try:
-        # 获取所有对话
-        dialogs = await client.get_dialogs()
-        scanned_count = 0
-        alert_count = 0
-        
-        for dialog in dialogs:
-            # 只检查群组和超级群组
-            if dialog.is_group or dialog.is_channel:
-                group_id = dialog.id
-                group_name = dialog.name
-                
-                if not group_name:
-                    continue
-                
-                scanned_count += 1
-                
-                # 检查群名是否包含触发关键词
-                group_name_lower = group_name.lower()
-                triggered_keywords = []
-                
-                for kw in config.TRIGGER_KEYWORDS:
-                    if kw in group_name_lower:
-                        triggered_keywords.append(kw)
-                
-                if triggered_keywords:
-                    # 检查冷却时间
-                    if alert_manager.should_alert(group_id, group_name, "", check_group_name=True):
-                        alert_manager.record_alert(group_id)
-                        alert_count += 1
-                        
-                        # ========= 构建可点击的群组链接 =========
-                        group_link = None
-                        try:
-                            # 尝试获取群组实体
-                            chat_entity = await client.get_entity(group_id)
-                            if chat_entity.username:
-                                # 有用户名：使用 t.me/username
-                                group_link = f"https://t.me/{chat_entity.username}"
-                            else:
-                                # 无用户名：使用 t.me/c/xxxxx 格式
-                                chat_id_str = str(group_id)
-                                if chat_id_str.startswith("-100"):
-                                    group_link = f"https://t.me/c/{chat_id_str[4:]}"
-                                else:
-                                    group_link = f"https://t.me/c/{abs(group_id)}"
-                        except Exception as e:
-                            logger.debug(f"获取群组链接失败 {group_name}: {e}")
-                            group_link = None
-                        
-                        # 构建可点击的群名（和转发消息格式完全一样）
-                        if group_link:
-                            safe_group_name = safe_markdown(group_name)
-                            # 关键：使用和转发消息完全相同的格式 【[群名](链接)】
-                            clickable_group_name = f"【[{safe_group_name}]({group_link})】"
-                        else:
-                            clickable_group_name = safe_markdown(group_name)
-                        
-                        # 发送警示 - 直接构建消息，不使用配置文件
-                        alert_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        
-                        # 直接构建完整消息（和转发消息格式一致）
-                        alert_message = f"""{clickable_group_name}
-⚠️ 风险警示
-
-该群组已暂停作业，请谨慎交易，注意资金安全！
-
-时间：{alert_time}
-
-📌 检测方式：群名扫描
-⚠️ 群名包含关键词：{', '.join(triggered_keywords)}"""
-                        
-                        target_chat_id = config.ALERT_FORWARD_CHAT_ID or config.FORWARD_CHAT_ID
-                        await send_alert_with_mention(target_chat_id, alert_message)
-                        
-                        logger.info(f"⚠️ 群名扫描触发警示: {group_name} (关键词: {triggered_keywords})")
-        
-        logger.info(f"✅ 群组扫描完成 - 扫描: {scanned_count}个群, 触发警示: {alert_count}个")
-        
-    except Exception as e:
-        logger.error(f"扫描群组失败: {e}")
-
-async def periodic_group_scan():
-    """定期扫描群组（每30分钟一次）"""
-    while True:
-        try:
-            # 休眠期间不扫描
-            if not is_sleep_time():
-                await scan_groups_for_alert()
-            else:
-                logger.debug("休眠期间跳过群组扫描")
-        except Exception as e:
-            logger.error(f"定期扫描异常: {e}")
-        
-        # 每30分钟扫描一次
-        await asyncio.sleep(1800)
-
 # ========= 转发消息（使用内联按钮） =========
 async def forward_message(event, text):
     """转发消息到目标群组（使用内联按钮）"""
@@ -587,10 +482,15 @@ async def forward_message(event, text):
         
         text = safe_markdown(text)
         
+        # ========= 检查是否包含担保关闭 =========
+        warning_msg = ""
+        if "担保关闭" in text.lower():
+            warning_msg = "\n\n🔴🔴🔴 【担保关闭预警】请所有成员高度警惕，注意资金安全！ 🔴🔴🔴"
+        
+        # 构建消息
         msg = f"""【[{chat_title}]({chat_link})】
 发信人：{sender_text}
-内容：{text}{remark}{original_link}
-"""
+内容：{text}{remark}{original_link}{warning_msg}"""
         
         await asyncio.sleep(random.uniform(1, 3))
         
@@ -624,120 +524,8 @@ async def forward_message(event, text):
         await asyncio.sleep(e.seconds)
     except Exception as e:
         logger.error(f"转发失败: {e}")
+        logger.error(f"转发失败: {e}")
 
-# ========= 发送警示消息 =========
-async def send_alert_with_mention(chat_id, message):
-    """发送警示消息"""
-    try:
-        # 直接发送传入的消息（已经包含完整格式）
-        await client.send_message(
-            chat_id, 
-            message, 
-            parse_mode='md'
-        )
-        
-        # 单独发送 @all 提醒
-        await asyncio.sleep(0.5)
-        await client.send_message(chat_id, "@all @all @all 请所有成员注意上方风险警示！")
-        
-        logger.info(f"已发送警示消息到 {chat_id}")
-        
-    except Exception as e:
-        logger.error(f"发送警示消息失败: {e}")
-        try:
-            await client.send_message(chat_id, message)
-        except:
-            pass
-
-# ========= 检测群组警示 =========
-async def check_and_alert(event):
-    """检测群组是否暂停作业并发送警示"""
-    try:
-        chat = await event.get_chat()
-        group_name = getattr(chat, "title", "未知群组")
-        group_id = event.chat_id
-        message_text = event.message.message if event.message else ""
-        
-        should_alert = False
-        trigger_word = ""
-        trigger_source = ""
-        
-        # 检查群名
-        group_name_lower = group_name.lower()
-        for kw in config.TRIGGER_KEYWORDS:
-            if kw in group_name_lower:
-                should_alert = True
-                trigger_word = kw
-                trigger_source = "群名"
-                break
-        
-        # 检查消息内容
-        if not should_alert and message_text:
-            message_lower = message_text.lower()
-            for kw in config.TRIGGER_KEYWORDS:
-                if kw in message_lower:
-                    should_alert = True
-                    trigger_word = kw
-                    trigger_source = "消息内容"
-                    break
-        
-        if not should_alert:
-            return False
-        
-        # 检查冷却时间
-        if not alert_manager.should_alert(group_id, group_name, message_text):
-            return False
-        
-        alert_manager.record_alert(group_id)
-        
-        # ========= 构建消息（群名用纯文本，单独加链接）=========
-        # 处理群名
-        chat_title = safe_markdown(group_name)
-        
-        # 构建独立的群组链接
-        if getattr(chat, "username", None):
-            group_url = f"https://t.me/{chat.username}"
-        else:
-            cid = str(group_id)
-            if cid.startswith("-100"):
-                group_url = f"https://t.me/c/{cid[4:]}"
-            else:
-                group_url = f"https://t.me/c/{abs(group_id)}"
-        
-        alert_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        msg = f"""【{chat_title}】
-
-🔴🔴🔴 风险警示 🔴🔴🔴
-
-⚠️ 该群组已触发风险警示（{trigger_word}）
-
-请谨慎交易，注意资金安全！
-
-📎 群组链接：{group_url}
-
-时间：{alert_time}
-
-📌 检测来源：{trigger_source}"""
-
-        if message_text and trigger_source == "消息内容":
-            msg += f"\n📝 触发消息：{message_text[:100]}"
-        
-        # 发送消息
-        target_chat_id = config.ALERT_FORWARD_CHAT_ID or config.FORWARD_CHAT_ID
-        await client.send_message(target_chat_id, msg, parse_mode="md")
-        
-        # 发送 @all 提醒
-        await asyncio.sleep(0.5)
-        await client.send_message(target_chat_id, "@all @all @all 请所有成员注意上方风险警示！")
-        
-        logger.info(f"⚠️ 发送群组警示: {group_name} (来源: {trigger_source})")
-        return True
-        
-    except Exception as e:
-        logger.error(f"check_and_alert 异常: {e}")
-        return False
-        
 # ========= 休眠状态监控 =========
 async def sleep_status_monitor():
     """监控休眠状态变化，进入/退出休眠时发送提醒"""
@@ -1252,7 +1040,6 @@ async def main():
                 asyncio.create_task(simulate_human_offline()),
                 asyncio.create_task(alert_cache_cleaner()),
                 asyncio.create_task(sleep_status_monitor()),
-                asyncio.create_task(periodic_group_scan()),
             ]
             
             await client.run_until_disconnected()
