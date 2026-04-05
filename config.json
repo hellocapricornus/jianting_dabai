@@ -15,6 +15,7 @@
   "update_branch": "main",
   "white_keywords": [
     "入金金额",
+    "担保关闭",
     "银行卡号后四位"
   ],
   "filter_keywords": [
