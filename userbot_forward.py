@@ -1,3 +1,12 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Telegram 消息监听转发机器人
+功能：监听群组消息，根据关键词过滤后转发到指定群组
+支持：配置文件热重载、GitHub自动更新、模拟真人离线
+"""
+
 from telethon import TelegramClient, events
 from telethon.errors import ChatRestrictedError, FloodWaitError
 from telethon.network.connection.tcpabridged import ConnectionTcpAbridged
@@ -13,10 +22,24 @@ import sys
 import random
 from telethon import functions
 from pathlib import Path
+from datetime import datetime
+import logging
+
+# ========= 日志配置 =========
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('bot.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # ========= 配置文件管理 =========
 class Config:
     """配置管理类，支持热重载"""
+    
     def __init__(self, config_path="config.json"):
         self.config_path = config_path
         self.last_load_time = 0
@@ -33,6 +56,7 @@ class Config:
             self.API_ID = config.get("api_id", 0)
             self.API_HASH = config.get("api_hash", "")
             self.FORWARD_CHAT_ID = config.get("forward_chat_id", 0)
+            self.YOUR_USER_ID = config.get("your_user_id", None)
             
             # 休眠配置
             self.SLEEP_START = config.get("sleep_start", 3)
@@ -44,6 +68,11 @@ class Config:
             
             # 心跳间隔
             self.HEARTBEAT_INTERVAL = config.get("heartbeat_interval", 1800)
+            
+            # 更新配置
+            self.AUTO_UPDATE_INTERVAL = config.get("auto_update_interval", 14400)
+            self.ENABLE_AUTO_UPDATE = config.get("enable_auto_update", True)
+            self.UPDATE_BRANCH = config.get("update_branch", "main")
             
             # 关键词（转小写优化性能）
             self.WHITE_KEYWORDS = {k.lower() for k in config.get("white_keywords", [])}
@@ -59,10 +88,10 @@ class Config:
             filter_regexes = config.get("filter_regexes", [])
             self.FILTER_REGEX = [re.compile(p) for p in filter_regexes]
             
-            print(f"✅ 配置文件加载成功: {self.config_path}")
+            logger.info(f"✅ 配置文件加载成功: {self.config_path}")
             
         except Exception as e:
-            print(f"❌ 配置文件加载失败: {e}")
+            logger.error(f"❌ 配置文件加载失败: {e}")
             raise
     
     def check_reload(self):
@@ -70,6 +99,8 @@ class Config:
         if time.time() - self.last_load_time > self.reload_interval:
             self.load_config()
             self.last_load_time = time.time()
+            return True
+        return False
 
 # 全局配置实例
 config = Config()
@@ -95,7 +126,8 @@ def safe_markdown(text):
         "[": "【", "]": "】",
         "(": "（", ")": "）",
         "`": "", "_": "-",
-        "*": "·"
+        "*": "·", "~": "—",
+        "|": "丨"
     }
     
     for k, v in replace_map.items():
@@ -147,10 +179,13 @@ def is_target(text):
 # ========= 优化后的防抖 =========
 class DebounceManager:
     """防抖管理器"""
+    
     def __init__(self):
         self.cache = {}
         self.debounce_time = config.DEBOUNCE_TIME
         self.cache_expire = config.CACHE_EXPIRE
+        self.hits = 0
+        self.misses = 0
     
     def is_duplicate(self, text):
         """检查是否重复"""
@@ -159,9 +194,11 @@ class DebounceManager:
         
         if key in self.cache:
             if now - self.cache[key] < self.debounce_time:
+                self.hits += 1
                 return True
         
         self.cache[key] = now
+        self.misses += 1
         return False
     
     def clean_expired(self):
@@ -170,10 +207,15 @@ class DebounceManager:
         remove_keys = [k for k, v in self.cache.items() if now - v > self.cache_expire]
         for k in remove_keys:
             del self.cache[k]
+        if remove_keys:
+            logger.debug(f"清理了 {len(remove_keys)} 条过期缓存")
         return len(remove_keys)
     
     def get_size(self):
         return len(self.cache)
+    
+    def get_stats(self):
+        return {"size": self.get_size(), "hits": self.hits, "misses": self.misses}
 
 debounce_manager = DebounceManager()
 
@@ -185,13 +227,19 @@ def load_marked_users():
     try:
         with open(MARKED_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    except:
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        logger.error(f"加载标记用户失败: {e}")
         return {}
 
 def save_marked_users(users):
     """保存标记用户"""
-    with open(MARKED_FILE, "w", encoding="utf-8") as f:
-        json.dump(users, f, ensure_ascii=False, indent=2)
+    try:
+        with open(MARKED_FILE, "w", encoding="utf-8") as f:
+            json.dump(users, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"保存标记用户失败: {e}")
 
 marked_users = load_marked_users()
 
@@ -206,10 +254,15 @@ client = TelegramClient(
     request_retries=10
 )
 
+# ========= 全局统计变量 =========
+message_counter = 0
+forward_counter = 0
+start_time = time.time()
+
 # ========= 修复后的模拟真人离线 =========
 async def simulate_human_offline():
     """模拟真人离线状态（修复版）"""
-    print("🟢 启动模拟在线/离线任务")
+    logger.info("🟢 启动模拟在线/离线任务")
     
     while True:
         try:
@@ -220,7 +273,7 @@ async def simulate_human_offline():
             
             # 在线时段
             online_time = random.randint(1800, 5400)
-            print(f"🟢 模拟在线 {online_time // 60} 分钟")
+            logger.info(f"🟢 模拟在线 {online_time // 60} 分钟")
             await client(functions.account.UpdateStatusRequest(offline=False))
             await asyncio.sleep(online_time)
             
@@ -230,23 +283,30 @@ async def simulate_human_offline():
             
             # 离线时段
             offline_time = random.randint(120, 360)
-            print(f"🔴 模拟离线 {offline_time // 60} 分钟")
+            logger.info(f"🔴 模拟离线 {offline_time // 60} 分钟")
             await client(functions.account.UpdateStatusRequest(offline=True))
             await asyncio.sleep(offline_time)
             
         except Exception as e:
-            print(f"simulate_human_offline 异常: {e}")
+            logger.error(f"simulate_human_offline 异常: {e}")
             await asyncio.sleep(60)
 
 # ========= GitHub自动更新 =========
 async def github_auto_update():
     """GitHub自动更新"""
     if not os.path.isdir(".git"):
+        logger.info("⚠️ 当前不是Git仓库，跳过自动更新")
         return
+    
+    if not config.ENABLE_AUTO_UPDATE:
+        logger.info("⚠️ 自动更新已禁用")
+        return
+    
+    logger.info(f"🟢 启动GitHub自动更新任务（间隔{config.AUTO_UPDATE_INTERVAL // 3600}小时）")
     
     while True:
         try:
-            print("🔍 检查 GitHub 更新")
+            logger.info("🔍 检查 GitHub 更新")
             
             # 获取当前分支
             branch = subprocess.check_output(
@@ -274,16 +334,26 @@ async def github_auto_update():
             ).strip()
             
             if local != remote:
-                await client.send_message("me", "🚀 GitHub 发现新版本\n开始自动更新")
-                print("🚀 发现新版本，自动更新")
+                logger.info(f"🚀 发现新版本: {local[:7]} -> {remote[:7]}")
+                await client.send_message(
+                    "me", 
+                    f"🚀 GitHub 发现新版本\n本地: {local[:7]}\n远程: {remote[:7]}\n开始自动更新"
+                )
+                
+                # 执行更新
                 subprocess.run(["git", "pull"], check=True)
-                print("♻️ 重启程序")
+                
+                logger.info("♻️ 重启程序")
+                await client.send_message("me", "✅ 更新完成，正在重启...")
+                await asyncio.sleep(2)
+                
+                # 重启程序
                 os.execv(sys.executable, [sys.executable] + sys.argv)
             
         except Exception as e:
-            print(f"GitHub 更新检查失败: {e}")
+            logger.error(f"GitHub 更新检查失败: {e}")
         
-        await asyncio.sleep(3600)
+        await asyncio.sleep(config.AUTO_UPDATE_INTERVAL)
 
 # ========= 转发消息 =========
 async def forward_message(event, text):
@@ -343,31 +413,40 @@ async def forward_message(event, text):
         )
         
         forward_counter += 1
+        logger.debug(f"转发消息: {text[:50]}...")
         
     except ChatRestrictedError:
-        print("⚠️ 频道禁止发消息")
+        logger.warning("⚠️ 频道禁止发消息")
     except FloodWaitError as e:
-        print(f"⚠️ FloodWait {e.seconds}s")
+        logger.warning(f"⚠️ FloodWait {e.seconds}s")
         await asyncio.sleep(e.seconds)
     except Exception as e:
-        print("转发失败:", e)
+        logger.error(f"转发失败: {e}")
 
 # ========= 私聊命令（带权限验证） =========
-YOUR_USER_ID = None  # 设置你的用户ID
-
 async def init_user_id():
     """初始化你的用户ID"""
     global YOUR_USER_ID
     me = await client.get_me()
     YOUR_USER_ID = me.id
-    print(f"✅ 当前用户ID: {YOUR_USER_ID}")
+    
+    # 如果配置文件中没有设置，自动设置
+    if config.YOUR_USER_ID is None:
+        logger.info(f"⚠️ 配置文件中未设置your_user_id，自动设置为: {YOUR_USER_ID}")
+        config.YOUR_USER_ID = YOUR_USER_ID
+    
+    logger.info(f"✅ 当前用户ID: {YOUR_USER_ID}")
+
+def is_owner(event):
+    """检查是否为机器人主人"""
+    return event.sender_id == config.YOUR_USER_ID
 
 @client.on(events.NewMessage(pattern=r'^/mark_id (\d+) (.+)'))
 async def mark_user(event):
     """标记用户（仅自己可用）"""
     if not event.is_private:
         return
-    if event.sender_id != YOUR_USER_ID:
+    if not is_owner(event):
         await event.reply("❌ 权限不足，只有机器人主人可以使用此命令")
         return
     
@@ -376,13 +455,14 @@ async def mark_user(event):
     save_marked_users(marked_users)
     
     await event.reply(f"✅ 标记成功\n{uid} → {remark}")
+    logger.info(f"标记用户: {uid} -> {remark}")
 
 @client.on(events.NewMessage(pattern=r'^/unmark_id (\d+)'))
 async def unmark_user(event):
     """取消标记（仅自己可用）"""
     if not event.is_private:
         return
-    if event.sender_id != YOUR_USER_ID:
+    if not is_owner(event):
         await event.reply("❌ 权限不足，只有机器人主人可以使用此命令")
         return
     
@@ -391,7 +471,8 @@ async def unmark_user(event):
     if uid in marked_users:
         del marked_users[uid]
         save_marked_users(marked_users)
-        await event.reply("❌ 已删除标记")
+        await event.reply(f"❌ 已删除标记: {uid}")
+        logger.info(f"取消标记: {uid}")
     else:
         await event.reply("❌ 未找到该用户标记")
 
@@ -400,21 +481,31 @@ async def show_stats(event):
     """显示统计信息（仅自己可用）"""
     if not event.is_private:
         return
-    if event.sender_id != YOUR_USER_ID:
+    if not is_owner(event):
         return
     
     global message_counter, forward_counter, start_time
     
     uptime = int(time.time() - start_time)
-    cache_size = debounce_manager.get_size()
+    cache_stats = debounce_manager.get_stats()
     
     stats = f"""📊 机器人统计
 
 📈 监听消息: {message_counter}
 📤 转发消息: {forward_counter}
+📊 转发率: {(forward_counter/message_counter*100):.1f}%  (如果有消息)
 ⏱️ 运行时间: {uptime // 3600}小时 {(uptime % 3600) // 60}分钟
-💾 缓存大小: {cache_size}
-🔧 配置重载间隔: {config.reload_interval}秒
+
+💾 缓存统计:
+   - 缓存大小: {cache_stats['size']}
+   - 命中次数: {cache_stats['hits']}
+   - 未命中: {cache_stats['misses']}
+   - 命中率: {(cache_stats['hits']/(cache_stats['hits']+cache_stats['misses'])*100):.1f}%  (如果有数据)
+
+🔧 配置信息:
+   - 转发群组: {config.FORWARD_CHAT_ID}
+   - 休眠时间: {config.SLEEP_START}:00 - {config.SLEEP_END}:00
+   - 自动更新: {'开启' if config.ENABLE_AUTO_UPDATE else '关闭'}
 """
     
     await event.reply(stats)
@@ -424,20 +515,112 @@ async def reload_config(event):
     """重载配置（仅自己可用）"""
     if not event.is_private:
         return
-    if event.sender_id != YOUR_USER_ID:
+    if not is_owner(event):
         return
     
     try:
         config.load_config()
         await event.reply("✅ 配置重载成功")
+        logger.info("配置重载成功")
     except Exception as e:
         await event.reply(f"❌ 配置重载失败: {e}")
+        logger.error(f"配置重载失败: {e}")
+
+@client.on(events.NewMessage(pattern=r'^/update$'))
+async def force_update(event):
+    """手动触发GitHub更新（仅自己可用）"""
+    if not event.is_private:
+        return
+    if not is_owner(event):
+        await event.reply("❌ 权限不足，只有机器人主人可以使用此命令")
+        return
+    
+    await event.reply("🔄 正在检查更新...")
+    logger.info("手动触发更新检查")
+    
+    try:
+        if not os.path.isdir(".git"):
+            await event.reply("❌ 当前不是Git仓库，无法自动更新")
+            return
+        
+        # 获取当前分支
+        branch = subprocess.check_output(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            text=True
+        ).strip()
+        
+        # 获取远程更新
+        subprocess.run(
+            ["git", "fetch", "origin"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30
+        )
+        
+        # 比较版本
+        local = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            text=True
+        ).strip()
+        
+        remote = subprocess.check_output(
+            ["git", "rev-parse", f"origin/{branch}"],
+            text=True
+        ).strip()
+        
+        if local != remote:
+            await event.reply(f"🚀 发现新版本\n本地: {local[:7]}\n远程: {remote[:7]}\n开始自动更新...")
+            logger.info(f"发现新版本，开始更新: {local[:7]} -> {remote[:7]}")
+            
+            # 执行更新
+            subprocess.run(["git", "pull"], check=True)
+            
+            await event.reply("✅ 更新完成，3秒后重启...")
+            await asyncio.sleep(3)
+            
+            # 重启程序
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        else:
+            await event.reply(f"✅ 已是最新版本\n当前版本: {local[:7]}")
+            
+    except Exception as e:
+        await event.reply(f"❌ 更新失败: {e}")
+        logger.error(f"更新失败: {e}")
+
+@client.on(events.NewMessage(pattern=r'^/help$'))
+async def show_help(event):
+    """显示帮助信息（仅自己可用）"""
+    if not event.is_private:
+        return
+    if not is_owner(event):
+        return
+    
+    help_text = """🤖 **机器人命令帮助**
+
+**管理命令：**
+• `/stats` - 查看统计信息
+• `/reload` - 重载配置文件
+• `/update` - 手动检查并更新代码
+• `/help` - 显示此帮助
+
+**标记命令：**
+• `/mark_id <用户ID> <备注>` - 标记用户
+• `/unmark_id <用户ID>` - 取消标记
+
+**功能说明：**
+• 自动监听群组消息
+• 根据关键词过滤转发
+• 支持配置文件热重载
+• 支持GitHub自动更新
+• 模拟真人在线/离线状态
+
+**配置文件：** `config.json`
+**日志文件：** `bot.log`
+"""
+    
+    await event.reply(help_text, parse_mode="md")
 
 # ========= 主监听 =========
-message_counter = 0
-forward_counter = 0
-start_time = time.time()
-
 @client.on(events.NewMessage)
 async def handler(event):
     """主监听：优化过滤顺序，白名单优先转发"""
@@ -464,10 +647,9 @@ async def handler(event):
         
         # 定期清理缓存和重载配置
         if message_counter % 100 == 0:
-            cleaned = debounce_manager.clean_expired()
-            config.check_reload()
-            if cleaned:
-                print(f"🧹 清理了 {cleaned} 条过期缓存")
+            debounce_manager.clean_expired()
+            if config.check_reload():
+                logger.info("配置已热重载")
         
         # —— 高效过滤：先屏蔽广告与垃圾信息 —— #
         if is_block(text):
@@ -496,7 +678,7 @@ async def handler(event):
         await forward_message(event, text)
         
     except Exception as e:
-        print("handler异常:", e)
+        logger.error(f"handler异常: {e}")
 
 # ========= 日报 =========
 async def daily_report():
@@ -505,17 +687,34 @@ async def daily_report():
     
     while True:
         try:
-            await asyncio.sleep(86400)
+            await asyncio.sleep(86400)  # 24小时
+            
             uptime = int(time.time() - start_time)
-            report = (
-                f"📊 机器人运行报告\n\n"
-                f"监听消息数：{message_counter}\n"
-                f"转发消息数：{forward_counter}\n"
-                f"运行时间：{uptime // 3600} 小时 { (uptime % 3600) // 60 } 分钟"
-            )
+            cache_stats = debounce_manager.get_stats()
+            
+            report = f"""📊 机器人运行日报
+
+📅 日期: {datetime.now().strftime('%Y-%m-%d')}
+
+📈 今日统计:
+   - 监听消息: {message_counter}
+   - 转发消息: {forward_counter}
+   - 转发率: {(forward_counter/message_counter*100):.1f}% (如果有消息)
+
+⏱️ 运行时长: {uptime // 3600}小时 {(uptime % 3600) // 60}分钟
+
+💾 缓存效率:
+   - 命中率: {(cache_stats['hits']/(cache_stats['hits']+cache_stats['misses'])*100):.1f}% (如果有数据)
+   - 缓存大小: {cache_stats['size']}
+
+🔧 状态: {'运行中' if not is_sleep_time() else '休眠中'}
+"""
+            
             await client.send_message("me", report)
+            logger.info("每日报告已发送")
+            
         except Exception as e:
-            print(f"daily_report 异常: {e}")
+            logger.error(f"daily_report 异常: {e}")
 
 # ========= 心跳 =========
 async def heartbeat():
@@ -524,6 +723,8 @@ async def heartbeat():
     
     while True:
         try:
+            await asyncio.sleep(config.HEARTBEAT_INTERVAL)
+            
             uptime = int(time.time() - start_time)
             
             if is_sleep_time():
@@ -531,21 +732,20 @@ async def heartbeat():
             else:
                 status = "🟢 运行中"
             
-            msg = f"""💓 心跳检测
+            msg = f"""💓 心跳检测 [{datetime.now().strftime('%H:%M:%S')}]
 
-状态：{status}
-监听消息：{message_counter}
-转发消息：{forward_counter}
-运行时间：{uptime // 3600}小时 {(uptime % 3600) // 60}分钟
-缓存大小：{debounce_manager.get_size()}
+状态: {status}
+监听消息: {message_counter}
+转发消息: {forward_counter}
+运行时间: {uptime // 3600}小时 {(uptime % 3600) // 60}分钟
+缓存大小: {debounce_manager.get_size()}
 """
             
             await client.send_message("me", msg)
+            logger.debug("心跳已发送")
             
         except Exception as e:
-            print("心跳发送失败:", e)
-        
-        await asyncio.sleep(config.HEARTBEAT_INTERVAL)
+            logger.error(f"心跳发送失败: {e}")
 
 # ========= 主函数 =========
 async def main():
@@ -558,8 +758,8 @@ async def main():
             # 初始化用户ID
             await init_user_id()
             
-            print("✅ 机器人启动成功")
-            await client.send_message("me", "🤖 监听机器人已启动\n状态：运行中")
+            logger.info("✅ 机器人启动成功")
+            await client.send_message("me", "🤖 监听机器人已启动\n状态：运行中\n输入 /help 查看帮助")
             
             # 创建所有后台任务
             tasks = [
@@ -572,7 +772,7 @@ async def main():
             await client.run_until_disconnected()
             
         except Exception as e:
-            print("❌ 连接异常:", e)
+            logger.error(f"❌ 连接异常: {e}")
             try:
                 await client.send_message("me", f"⚠️ 机器人异常\n{str(e)[:200]}\n5秒后重连")
             except:
@@ -580,5 +780,7 @@ async def main():
             await asyncio.sleep(5)
 
 if __name__ == "__main__":
+    logger.info("启动 Telegram 监听机器人...")
+    
     with client:
         client.loop.run_until_complete(main())
