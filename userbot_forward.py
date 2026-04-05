@@ -557,13 +557,13 @@ async def forward_message(event, text):
         
         # 构建聊天链接
         if getattr(chat, "username", None):
-            chat_link = f"tg://resolve?domain={chat.username}"
+            chat_link = f"https://t.me/{chat.username}"
         else:
             cid = str(event.chat_id)
             if cid.startswith("-100"):
                 chat_link = f"https://t.me/c/{cid[4:]}"
             else:
-                chat_link = f"tg://user?id={abs(event.chat_id)}"
+                chat_link = "https://t.me"
         
         sender_name = safe_markdown(get_display_name(sender))
         
@@ -694,18 +694,15 @@ async def check_and_alert(event):
         # 处理群名（和 forward_message 一样）
         chat_title = safe_markdown(group_name)
         
-        # 构建聊天链接 - 使用 tg:// 协议（App内直接打开）
+        # 构建聊天链接 - 改回 https://t.me/ 格式
         if getattr(chat, "username", None):
-            # 有用户名：tg://resolve?domain=xxx
-            chat_link = f"tg://resolve?domain={chat.username}"
+            chat_link = f"https://t.me/{chat.username}"
         else:
             cid = str(group_id)
             if cid.startswith("-100"):
-                # 群组：使用 https://t.me/c/xxx（tg:// 不支持群组ID直接打开）
                 chat_link = f"https://t.me/c/{cid[4:]}"
             else:
-                # 用户：tg://user?id=xxx
-                chat_link = f"tg://user?id={abs(group_id)}"
+                chat_link = "https://t.me"
         
         # 和转发消息一模一样的格式
         alert_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
