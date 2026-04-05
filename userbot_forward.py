@@ -676,7 +676,7 @@ async def check_and_alert(event):
         # 构建可点击的群名（加上 safe_markdown）
         if group_link:
             safe_group_name = safe_markdown(group_name)
-            clickable_group_name = f"[{safe_group_name}]({group_link})"
+            clickable_group_name = f"【[{safe_group_name}]({group_link})】"
         else:
             clickable_group_name = safe_markdown(group_name)
         
