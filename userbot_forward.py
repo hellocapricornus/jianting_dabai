@@ -4,7 +4,7 @@
 """
 Telegram 消息监听转发机器人
 功能：监听群组消息，根据关键词过滤后转发到指定群组
-支持：配置文件热重载、GitHub自动更新、模拟真人离线
+支持：配置文件热重载、GitHub自动更新、模拟真人离线、群组警示
 """
 
 from telethon import TelegramClient, events
@@ -87,6 +87,15 @@ class Config:
             
             filter_regexes = config.get("filter_regexes", [])
             self.FILTER_REGEX = [re.compile(p) for p in filter_regexes]
+            
+            # ========= 新增：警示配置 =========
+            alert_config = config.get("alert_config", {})
+            self.ALERT_ENABLED = alert_config.get("enabled", True)
+            self.TRIGGER_KEYWORDS = [k.lower() for k in alert_config.get("trigger_keywords", ["暂停作业"])]
+            self.ALERT_MESSAGE = alert_config.get("alert_message", "⚠️ 风险警示\n\n群组【{group_name}】已暂停作业！\n\n请谨慎交易，注意资金安全！\n\n时间：{time}")
+            self.ALERT_MENTION_ALL = alert_config.get("mention_all", True)
+            self.ALERT_COOLDOWN_MINUTES = alert_config.get("cooldown_minutes", 60)
+            self.ALERT_FORWARD_CHAT_ID = alert_config.get("alert_forward_chat_id", self.FORWARD_CHAT_ID)
             
             logger.info(f"✅ 配置文件加载成功: {self.config_path}")
             
@@ -242,6 +251,58 @@ def save_marked_users(users):
         logger.error(f"保存标记用户失败: {e}")
 
 marked_users = load_marked_users()
+
+# ========= 新增：警示管理器类 =========
+class AlertManager:
+    """群组警示管理器，防止重复警示"""
+    
+    def __init__(self):
+        self.alerted_groups = {}  # {group_id: last_alert_time}
+        self.cooldown = config.ALERT_COOLDOWN_MINUTES * 60
+    
+    def should_alert(self, group_id, group_name, message_text):
+        """检查是否应该发送警示"""
+        # 检查功能是否启用
+        if not config.ALERT_ENABLED:
+            return False
+        
+        # 检查消息中是否包含触发词
+        text_lower = message_text.lower()
+        is_triggered = any(kw in text_lower for kw in config.TRIGGER_KEYWORDS)
+        
+        if not is_triggered:
+            return False
+        
+        # 检查冷却时间
+        now = time.time()
+        if group_id in self.alerted_groups:
+            last_alert = self.alerted_groups[group_id]
+            if now - last_alert < self.cooldown:
+                logger.debug(f"群组 {group_name} 在冷却期内，跳过警示")
+                return False
+        
+        return True
+    
+    def record_alert(self, group_id):
+        """记录警示时间"""
+        self.alerted_groups[group_id] = time.time()
+    
+    def clean_expired(self):
+        """清理过期的警示记录"""
+        now = time.time()
+        expired = [gid for gid, last_time in self.alerted_groups.items() 
+                   if now - last_time > self.cooldown * 2]
+        for gid in expired:
+            del self.alerted_groups[gid]
+    
+    def get_stats(self):
+        """获取警示统计"""
+        now = time.time()
+        active = len([gid for gid, last_time in self.alerted_groups.items() 
+                     if now - last_time < self.cooldown])
+        return {"total": len(self.alerted_groups), "active": active}
+
+alert_manager = AlertManager()
 
 # ========= Telegram客户端初始化 =========
 client = TelegramClient(
@@ -423,6 +484,101 @@ async def forward_message(event, text):
     except Exception as e:
         logger.error(f"转发失败: {e}")
 
+# ========= 新增：发送警示消息并@所有人 =========
+async def send_alert_with_mention(chat_id, message):
+    """发送警示消息并@所有人"""
+    try:
+        if config.ALERT_MENTION_ALL:
+            # 尝试@所有人
+            try:
+                # 方法1：使用 @all 标签
+                message_with_mention = f"@all {message}"
+                await client.send_message(chat_id, message_with_mention)
+                logger.info(f"已发送警示消息（含@all）到 {chat_id}")
+            except Exception as e:
+                logger.warning(f"@all 方式失败: {e}，使用普通消息")
+                await client.send_message(chat_id, message)
+        else:
+            await client.send_message(chat_id, message)
+            logger.info(f"已发送警示消息到 {chat_id}")
+            
+    except Exception as e:
+        logger.error(f"发送警示消息失败: {e}")
+
+# ========= 新增：检测群组是否暂停作业并发送警示 =========
+async def check_and_alert(event):
+    """检测群组是否暂停作业并发送警示"""
+    try:
+        # 获取群组信息
+        chat = await event.get_chat()
+        group_name = getattr(chat, "title", "未知群组")
+        group_id = event.chat_id
+        
+        # 获取消息内容
+        message_text = event.message.message if event.message else ""
+        
+        # 检查是否需要警示
+        should_alert = False
+        trigger_word = ""
+        
+        # 检查群名
+        group_name_lower = group_name.lower()
+        for kw in config.TRIGGER_KEYWORDS:
+            if kw in group_name_lower:
+                should_alert = True
+                trigger_word = kw
+                break
+        
+        # 检查消息内容
+        if not should_alert and message_text:
+            message_lower = message_text.lower()
+            for kw in config.TRIGGER_KEYWORDS:
+                if kw in message_lower:
+                    should_alert = True
+                    trigger_word = kw
+                    break
+        
+        if not should_alert:
+            return False
+        
+        # 检查冷却时间
+        if not alert_manager.should_alert(group_id, group_name, message_text):
+            return False
+        
+        # 记录警示
+        alert_manager.record_alert(group_id)
+        
+        # 构建警示消息
+        alert_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        alert_message = config.ALERT_MESSAGE.format(
+            group_name=group_name,
+            time=alert_time,
+            trigger_word=trigger_word
+        )
+        
+        # 添加消息来源信息
+        if message_text:
+            alert_message += f"\n\n📝 触发消息：{message_text[:100]}"
+        
+        # 发送警示到配置的群组
+        target_chat_id = config.ALERT_FORWARD_CHAT_ID or config.FORWARD_CHAT_ID
+        
+        # 发送警示消息
+        await send_alert_with_mention(target_chat_id, alert_message)
+        
+        # 同时发送给机器人主人
+        try:
+            await client.send_message("me", f"🔔 群组警示\n\n群组：{group_name}\n触发词：{trigger_word}\n时间：{alert_time}")
+        except:
+            pass
+        
+        logger.info(f"⚠️ 发送群组警示: {group_name} (触发词: {trigger_word})")
+        return True
+        
+    except Exception as e:
+        logger.error(f"check_and_alert 异常: {e}")
+        return False
+
 # ========= 私聊命令（带权限验证） =========
 async def init_user_id():
     """初始化你的用户ID"""
@@ -488,6 +644,7 @@ async def show_stats(event):
     
     uptime = int(time.time() - start_time)
     cache_stats = debounce_manager.get_stats()
+    alert_stats = alert_manager.get_stats()
     
     stats = f"""📊 机器人统计
 
@@ -501,6 +658,12 @@ async def show_stats(event):
    - 命中次数: {cache_stats['hits']}
    - 未命中: {cache_stats['misses']}
    - 命中率: {(cache_stats['hits']/(cache_stats['hits']+cache_stats['misses'])*100):.1f}%  (如果有数据)
+
+🔔 警示统计:
+   - 功能状态: {'启用' if config.ALERT_ENABLED else '禁用'}
+   - 触发关键词: {', '.join(config.TRIGGER_KEYWORDS)}
+   - 冷却时间: {config.ALERT_COOLDOWN_MINUTES}分钟
+   - 警示记录: {alert_stats['total']}个群组
 
 🔧 配置信息:
    - 转发群组: {config.FORWARD_CHAT_ID}
@@ -520,6 +683,8 @@ async def reload_config(event):
     
     try:
         config.load_config()
+        # 更新警示管理器的冷却时间
+        alert_manager.cooldown = config.ALERT_COOLDOWN_MINUTES * 60
         await event.reply("✅ 配置重载成功")
         logger.info("配置重载成功")
     except Exception as e:
@@ -587,6 +752,54 @@ async def force_update(event):
         await event.reply(f"❌ 更新失败: {e}")
         logger.error(f"更新失败: {e}")
 
+# ========= 新增：警示统计命令 =========
+@client.on(events.NewMessage(pattern=r'^/alert_stats$'))
+async def show_alert_stats(event):
+    """显示警示统计（仅自己可用）"""
+    if not event.is_private:
+        return
+    if not is_owner(event):
+        return
+    
+    alert_stats = alert_manager.get_stats()
+    
+    stats = f"""🔔 警示系统统计
+
+📊 功能状态: {'✅ 启用' if config.ALERT_ENABLED else '❌ 禁用'}
+🔑 触发关键词: {', '.join(config.TRIGGER_KEYWORDS)}
+⏰ 冷却时间: {config.ALERT_COOLDOWN_MINUTES} 分钟
+📝 历史警示群组: {alert_stats['total']} 个
+🟢 冷却中群组: {alert_stats['active']} 个
+
+💡 当群名或消息包含触发关键词时，会自动发送警示并@所有人
+"""
+    
+    await event.reply(stats)
+
+# ========= 新增：手动触发警示命令 =========
+@client.on(events.NewMessage(pattern=r'^/alert_group (.+)'))
+async def manual_alert(event):
+    """手动触发群组警示（仅自己可用）"""
+    if not event.is_private:
+        return
+    if not is_owner(event):
+        await event.reply("❌ 权限不足")
+        return
+    
+    group_name = event.pattern_match.group(1)
+    
+    alert_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    alert_message = config.ALERT_MESSAGE.format(
+        group_name=group_name,
+        time=alert_time,
+        trigger_word="手动触发"
+    )
+    
+    target_chat_id = config.ALERT_FORWARD_CHAT_ID or config.FORWARD_CHAT_ID
+    await send_alert_with_mention(target_chat_id, alert_message)
+    
+    await event.reply(f"✅ 已发送警示消息到群组\n群组：{group_name}")
+
 @client.on(events.NewMessage(pattern=r'^/help$'))
 async def show_help(event):
     """显示帮助信息（仅自己可用）"""
@@ -606,6 +819,16 @@ async def show_help(event):
 **标记命令：**
 • `/mark_id <用户ID> <备注>` - 标记用户
 • `/unmark_id <用户ID>` - 取消标记
+
+**警示命令：**
+• `/alert_stats` - 查看警示系统统计
+• `/alert_group <群组名>` - 手动发送群组警示
+
+**警示功能说明：**
+• 自动检测群名或消息中的暂停作业关键词
+• 检测到后自动发送警示消息到指定群组
+• 支持@所有人提醒（需要管理员权限）
+• 每个群组有冷却时间，避免重复警示
 
 **功能说明：**
 • 自动监听群组消息
@@ -643,11 +866,15 @@ async def handler(event):
         if not text:
             return
         
+        # ========= 新增：群组警示检测（优先执行） =========
+        await check_and_alert(event)
+        
         message_counter += 1
         
         # 定期清理缓存和重载配置
         if message_counter % 100 == 0:
             debounce_manager.clean_expired()
+            alert_manager.clean_expired()
             if config.check_reload():
                 logger.info("配置已热重载")
         
@@ -691,6 +918,7 @@ async def daily_report():
             
             uptime = int(time.time() - start_time)
             cache_stats = debounce_manager.get_stats()
+            alert_stats = alert_manager.get_stats()
             
             report = f"""📊 机器人运行日报
 
@@ -706,6 +934,9 @@ async def daily_report():
 💾 缓存效率:
    - 命中率: {(cache_stats['hits']/(cache_stats['hits']+cache_stats['misses'])*100):.1f}% (如果有数据)
    - 缓存大小: {cache_stats['size']}
+
+🔔 警示统计:
+   - 触发警示: {alert_stats['total']} 次
 
 🔧 状态: {'运行中' if not is_sleep_time() else '休眠中'}
 """
@@ -739,6 +970,7 @@ async def heartbeat():
 转发消息: {forward_counter}
 运行时间: {uptime // 3600}小时 {(uptime % 3600) // 60}分钟
 缓存大小: {debounce_manager.get_size()}
+警示记录: {len(alert_manager.alerted_groups)}个群组
 """
             
             await client.send_message("me", msg)
@@ -746,6 +978,14 @@ async def heartbeat():
             
         except Exception as e:
             logger.error(f"心跳发送失败: {e}")
+
+# ========= 新增：定时清理警示缓存 =========
+async def alert_cache_cleaner():
+    """定时清理警示缓存"""
+    while True:
+        await asyncio.sleep(3600)  # 每小时清理一次
+        alert_manager.clean_expired()
+        logger.debug("警示缓存已清理")
 
 # ========= 主函数 =========
 async def main():
@@ -767,6 +1007,7 @@ async def main():
                 asyncio.create_task(daily_report()),
                 asyncio.create_task(github_auto_update()),
                 asyncio.create_task(simulate_human_offline()),
+                asyncio.create_task(alert_cache_cleaner()),  # 新增
             ]
             
             await client.run_until_disconnected()
