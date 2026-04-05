@@ -986,8 +986,6 @@ async def handler(event):
         if not text:
             return
         
-        await check_and_alert(event)
-        
         message_counter += 1
         
         if message_counter % 100 == 0:
