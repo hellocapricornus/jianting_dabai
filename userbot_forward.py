@@ -439,9 +439,9 @@ async def forward_message(event, text):
         
         sender_name = safe_markdown(get_display_name(sender))
         
-        # 发信人链接
+        # 发信人显示文本
         if sender.username:
-            sender_text = f"[{sender_name}](https://t.me/{sender.username})"
+            sender_text = f"@{sender.username}"
         else:
             sender_text = sender_name
         
@@ -463,14 +463,34 @@ async def forward_message(event, text):
 发信人：{sender_text}
 内容：{text}{remark}{original_link}
 """
+        # ========= 创建内联按钮 =========
+        from telethon import types
+        
+        # 创建联系发信人的按钮
+        contact_button = types.KeyboardButtonUrl(
+            text="📞 点击联系发信人",
+            url=f"tg://user?id={sender.id}"
+        )
+        
+        # 如果有用户名，也可以添加一个备用按钮
+        buttons = [[contact_button]]
+        
+        if sender.username:
+            username_button = types.KeyboardButtonUrl(
+                text="🔗 通过用户名联系",
+                url=f"https://t.me/{sender.username}"
+            )
+            buttons.append([username_button])
         
         await asyncio.sleep(random.uniform(1, 3))
         
+        # 发送带按钮的消息
         await client.send_message(
             config.FORWARD_CHAT_ID,
             msg,
             parse_mode="md",
-            link_preview=False
+            link_preview=False,
+            buttons=buttons  # 添加内联按钮
         )
         
         forward_counter += 1
