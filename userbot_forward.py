@@ -608,7 +608,7 @@ async def send_alert_with_mention(chat_id, message):
         
         # 添加醒目标记
         alert_header = "🔴🔴🔴 风险警示 🔴🔴🔴\n\n"
-        all_mentions = "@all @all @all\n\n"
+        all_mentions = "@所有人 @所有人 @所有人\n\n"
         
         full_message = f"{all_mentions}{alert_header}{message}"
         
