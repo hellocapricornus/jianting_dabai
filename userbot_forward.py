@@ -602,38 +602,33 @@ async def forward_message(event, text):
 
 # ========= 发送警示消息 =========
 async def send_alert_with_mention(chat_id, message):
-    """发送警示消息（最佳实践版）"""
+    """发送警示消息（分步发送，确保可靠）"""
     try:
         from telethon import types
         
-        # 创建可点击的 @所有人 链接（HTML格式）
-        mention_html = '<a href="tg://mention">所有人</a>'
-        
-        # 添加醒目标记
+        # 第一步：发送警示文字
         alert_header = "🔴🔴🔴 风险警示 🔴🔴🔴\n\n"
+        full_message = f"{alert_header}{message}\n\n@all @all @all"
         
-        # 构建完整消息：3个可点击的@所有人 + 警示内容
-        full_message = f"{mention_html} {mention_html} {mention_html}\n\n{alert_header}{message}"
+        await client.send_message(chat_id, full_message)
         
-        # 创建内联按钮
+        # 第二步：发送带按钮的消息
         buttons = [
-            [types.KeyboardButtonUrl("⚠️ 查看详情", "https://t.me/telegram")],
+            [types.KeyboardButtonUrl("⚠️ 我已了解风险", "https://t.me/telegram")],
             [types.KeyboardButtonUrl("📞 联系管理员", f"tg://user?id={config.YOUR_USER_ID}")]
         ]
         
-        # 发送第一条：文字 + 按钮（使用 html 解析模式）
         await client.send_message(
             chat_id,
-            full_message,
-            parse_mode='html',  # 关键：必须使用 html 模式
+            "⚠️ 请点击下方按钮确认或联系管理员：",
             buttons=buttons
         )
         
-        # 延迟1秒后发送第二条纯文字（确保通知）
-        await asyncio.sleep(1)
-        await client.send_message(chat_id, "⚠️ 请所有成员注意上方风险警示！")
+        # 第三步：发送最后提醒
+        await asyncio.sleep(0.5)
+        await client.send_message(chat_id, "@all 请务必查看上方风险警示！")
         
-        logger.info(f"已发送警示消息（@所有人 HTML方式）到 {chat_id}")
+        logger.info(f"已发送警示消息到 {chat_id}")
         
     except Exception as e:
         logger.error(f"发送警示消息失败: {e}")
