@@ -464,9 +464,9 @@ async def forward_message(event, text):
         
         # 发信人显示
         if sender.username:
-            sender_text = f"@{sender.username} (ID: {sender.id})"
+            sender_text = f"{sender_name} (@{sender.username})"
         else:
-            sender_text = f"{sender_name} (ID: {sender.id})"
+            sender_text = f"{sender_name}"
         
         # 标记信息
         remark = ""
@@ -485,7 +485,7 @@ async def forward_message(event, text):
         # ========= 检查是否包含担保关闭 =========
         warning_msg = ""
         if "担保关闭" in text.lower():
-            warning_msg = "\n\n🔴🔴🔴 【担保关闭预警】请所有成员高度警惕，注意资金安全！ 🔴🔴🔴"
+            warning_msg = "\n\n🚨🚨🚨⚠️⚠️⚠️🚨🚨🚨 【担保关闭预警】\n请所有成员高度警惕，注意资金安全！\n@KFCVME50 @Edisonvme200 @Edcvme300 @Edisonvme100"
         
         # 构建消息
         msg = f"""【[{chat_title}]({chat_link})】
