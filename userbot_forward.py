@@ -690,30 +690,31 @@ async def check_and_alert(event):
         
         alert_manager.record_alert(group_id)
         
-        # ========= 使用和转发消息完全一样的格式 =========
-        # 处理群名（和 forward_message 一样）
+        # ========= 构建消息（群名用纯文本，单独加链接）=========
+        # 处理群名
         chat_title = safe_markdown(group_name)
         
-        # 构建聊天链接 - 改回 https://t.me/ 格式
+        # 构建独立的群组链接
         if getattr(chat, "username", None):
-            chat_link = f"https://t.me/{chat.username}"
+            group_url = f"https://t.me/{chat.username}"
         else:
             cid = str(group_id)
             if cid.startswith("-100"):
-                chat_link = f"https://t.me/c/{cid[4:]}"
+                group_url = f"https://t.me/c/{cid[4:]}"
             else:
-                chat_link = "https://t.me"
+                group_url = f"https://t.me/c/{abs(group_id)}"
         
-        # 和转发消息一模一样的格式
         alert_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
-        msg = f"""【[{chat_title}]({chat_link})】
+        msg = f"""【{chat_title}】
 
 🔴🔴🔴 风险警示 🔴🔴🔴
 
 ⚠️ 该群组已触发风险警示（{trigger_word}）
 
 请谨慎交易，注意资金安全！
+
+📎 群组链接：{group_url}
 
 时间：{alert_time}
 
@@ -722,7 +723,7 @@ async def check_and_alert(event):
         if message_text and trigger_source == "消息内容":
             msg += f"\n📝 触发消息：{message_text[:100]}"
         
-        # 直接发送，不用 send_alert_with_mention
+        # 发送消息
         target_chat_id = config.ALERT_FORWARD_CHAT_ID or config.FORWARD_CHAT_ID
         await client.send_message(target_chat_id, msg, parse_mode="md")
         
