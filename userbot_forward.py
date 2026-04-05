@@ -497,22 +497,27 @@ async def scan_groups_for_alert():
                             logger.debug(f"获取群组链接失败 {group_name}: {e}")
                             group_link = None
                         
-                        # 构建可点击的群名
+                        # 构建可点击的群名（和转发消息格式完全一样）
                         if group_link:
                             safe_group_name = safe_markdown(group_name)
-                            clickable_group_name = f"[{safe_group_name}]({group_link})"
+                            # 关键：使用和转发消息完全相同的格式 【[群名](链接)】
+                            clickable_group_name = f"【[{safe_group_name}]({group_link})】"
                         else:
                             clickable_group_name = safe_markdown(group_name)
                         
-                        # 发送警示
+                        # 发送警示 - 直接构建消息，不使用配置文件
                         alert_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        alert_message = config.ALERT_MESSAGE.format(
-                            group_name=clickable_group_name,
-                            time=alert_time,
-                            trigger_word=", ".join(triggered_keywords)
-                        )
                         
-                        alert_message += f"\n\n📌 检测方式：群名扫描\n⚠️ 群名包含关键词：{', '.join(triggered_keywords)}"
+                        # 直接构建完整消息（和转发消息格式一致）
+                        alert_message = f"""{clickable_group_name}
+⚠️ 风险警示
+
+该群组已暂停作业，请谨慎交易，注意资金安全！
+
+时间：{alert_time}
+
+📌 检测方式：群名扫描
+⚠️ 群名包含关键词：{', '.join(triggered_keywords)}"""
                         
                         target_chat_id = config.ALERT_FORWARD_CHAT_ID or config.FORWARD_CHAT_ID
                         await send_alert_with_mention(target_chat_id, alert_message)
@@ -522,7 +527,6 @@ async def scan_groups_for_alert():
         logger.info(f"✅ 群组扫描完成 - 扫描: {scanned_count}个群, 触发警示: {alert_count}个")
         
     except Exception as e:
-        logger.error(f"扫描群组失败: {e}")
         logger.error(f"扫描群组失败: {e}")
 
 async def periodic_group_scan():
