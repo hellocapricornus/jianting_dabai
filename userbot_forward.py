@@ -420,6 +420,86 @@ async def github_auto_update():
         
         await asyncio.sleep(config.AUTO_UPDATE_INTERVAL)
 
+# ========= 定时扫描群组，检测群名是否包含警示词 =========
+async def scan_groups_for_alert():
+    """定时扫描所有群组，检测群名是否包含警示关键词"""
+    if not config.ALERT_ENABLED:
+        return
+    
+    logger.info("🔍 开始扫描群组，检测群名是否包含警示词...")
+    
+    try:
+        # 获取所有对话
+        dialogs = await client.get_dialogs()
+        scanned_count = 0
+        alert_count = 0
+        
+        for dialog in dialogs:
+            # 只检查群组和超级群组
+            if dialog.is_group or dialog.is_channel:
+                group_id = dialog.id
+                group_name = dialog.name
+                
+                if not group_name:
+                    continue
+                
+                scanned_count += 1
+                
+                # 检查群名是否包含触发关键词
+                group_name_lower = group_name.lower()
+                triggered_keywords = []
+                
+                for kw in config.TRIGGER_KEYWORDS:
+                    if kw in group_name_lower:
+                        triggered_keywords.append(kw)
+                
+                if triggered_keywords:
+                    # 检查冷却时间
+                    if alert_manager.should_alert(group_id, group_name, ""):
+                        alert_manager.record_alert(group_id)
+                        alert_count += 1
+                        
+                        # 发送警示
+                        alert_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        alert_message = config.ALERT_MESSAGE.format(
+                            group_name=group_name,
+                            time=alert_time,
+                            trigger_word=", ".join(triggered_keywords)
+                        )
+                        
+                        alert_message += f"\n\n📌 检测方式：群名扫描\n⚠️ 群名包含关键词：{', '.join(triggered_keywords)}"
+                        
+                        target_chat_id = config.ALERT_FORWARD_CHAT_ID or config.FORWARD_CHAT_ID
+                        await send_alert_with_mention(target_chat_id, alert_message)
+                        
+                        # 通知主人
+                        try:
+                            await client.send_message("me", f"🔔 群组警示（群名扫描）\n\n群组：{group_name}\n触发词：{', '.join(triggered_keywords)}\n时间：{alert_time}")
+                        except:
+                            pass
+                        
+                        logger.info(f"⚠️ 群名扫描触发警示: {group_name} (关键词: {triggered_keywords})")
+        
+        logger.info(f"✅ 群组扫描完成 - 扫描: {scanned_count}个群, 触发警示: {alert_count}个")
+        
+    except Exception as e:
+        logger.error(f"扫描群组失败: {e}")
+
+async def periodic_group_scan():
+    """定期扫描群组（每30分钟一次）"""
+    while True:
+        try:
+            # 休眠期间不扫描
+            if not is_sleep_time():
+                await scan_groups_for_alert()
+            else:
+                logger.debug("休眠期间跳过群组扫描")
+        except Exception as e:
+            logger.error(f"定期扫描异常: {e}")
+        
+        # 每30分钟扫描一次
+        await asyncio.sleep(1800)
+
 # ========= 转发消息（使用内联按钮） =========
 async def forward_message(event, text):
     """转发消息到目标群组（使用内联按钮）"""
@@ -522,7 +602,7 @@ async def send_alert_with_mention(chat_id, message):
 
 # ========= 检测群组警示 =========
 async def check_and_alert(event):
-    """检测群组是否暂停作业并发送警示"""
+    """检测群组是否暂停作业并发送警示（增强版）"""
     try:
         chat = await event.get_chat()
         group_name = getattr(chat, "title", "未知群组")
@@ -531,32 +611,39 @@ async def check_and_alert(event):
         
         should_alert = False
         trigger_word = ""
+        trigger_source = ""
         
-        # 检查群名
+        # ========= 优先检查群名 =========
         group_name_lower = group_name.lower()
         for kw in config.TRIGGER_KEYWORDS:
             if kw in group_name_lower:
                 should_alert = True
                 trigger_word = kw
+                trigger_source = "群名"
                 break
         
-        # 检查消息内容
+        # ========= 检查消息内容 =========
         if not should_alert and message_text:
             message_lower = message_text.lower()
             for kw in config.TRIGGER_KEYWORDS:
                 if kw in message_lower:
                     should_alert = True
                     trigger_word = kw
+                    trigger_source = "消息内容"
                     break
         
         if not should_alert:
             return False
         
+        # 检查冷却时间
         if not alert_manager.should_alert(group_id, group_name, message_text):
+            logger.debug(f"群组 {group_name} 在冷却期内，跳过警示")
             return False
         
+        # 记录警示
         alert_manager.record_alert(group_id)
         
+        # 构建警示消息
         alert_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         alert_message = config.ALERT_MESSAGE.format(
             group_name=group_name,
@@ -564,25 +651,31 @@ async def check_and_alert(event):
             trigger_word=trigger_word
         )
         
-        if message_text:
-            alert_message += f"\n\n📝 触发消息：{message_text[:100]}"
+        alert_message += f"\n\n📌 检测来源：{trigger_source}"
         
+        if message_text and trigger_source == "消息内容":
+            alert_message += f"\n📝 触发消息：{message_text[:100]}"
+        
+        if trigger_source == "群名":
+            alert_message += f"\n⚠️ 群名称包含敏感词，请特别注意！"
+        
+        # 发送警示
         target_chat_id = config.ALERT_FORWARD_CHAT_ID or config.FORWARD_CHAT_ID
-        
         await send_alert_with_mention(target_chat_id, alert_message)
         
+        # 同时发送给主人
         try:
-            await client.send_message("me", f"🔔 群组警示\n\n群组：{group_name}\n触发词：{trigger_word}\n时间：{alert_time}")
+            owner_msg = f"🔔 群组警示（{trigger_source}）\n\n群组：{group_name}\n触发词：{trigger_word}\n时间：{alert_time}"
+            await client.send_message("me", owner_msg)
         except:
             pass
         
-        logger.info(f"⚠️ 发送群组警示: {group_name} (触发词: {trigger_word})")
+        logger.info(f"⚠️ 发送群组警示: {group_name} (来源: {trigger_source}, 触发词: {trigger_word})")
         return True
         
     except Exception as e:
         logger.error(f"check_and_alert 异常: {e}")
         return False
-
 # ========= 休眠状态监控 =========
 async def sleep_status_monitor():
     """监控休眠状态变化，进入/退出休眠时发送提醒"""
@@ -776,6 +869,16 @@ async def unmark_user(event):
         del marked_users[uid]
         save_marked_users(marked_users)
         await event.reply(f"❌ 已删除标记: {uid}")
+
+@client.on(events.NewMessage(pattern=r'^/scan$'))
+async def manual_scan(event):
+    """手动扫描所有群组（仅自己可用）"""
+    if not event.is_private or not is_owner(event):
+        return
+    
+    await event.reply("🔍 开始手动扫描群组...")
+    await scan_groups_for_alert()
+    await event.reply("✅ 群组扫描完成")
 
 @client.on(events.NewMessage(pattern=r'^/stats$'))
 async def show_stats(event):
@@ -985,6 +1088,7 @@ async def show_help(event):
 • `/sleep` - 查看休眠状态
 • `/ping` - 测试机器人是否在线
 • `/alert_stats` - 查看警示系统统计
+• `/scan` - 手动扫描所有群组，检测群名警示词
 
 **⚙️ 管理命令：**
 • `/reload` - 重载配置文件
@@ -1086,6 +1190,7 @@ async def main():
                 asyncio.create_task(simulate_human_offline()),
                 asyncio.create_task(alert_cache_cleaner()),
                 asyncio.create_task(sleep_status_monitor()),
+                asyncio.create_task(periodic_group_scan()),
             ]
             
             await client.run_until_disconnected()
