@@ -499,9 +499,10 @@ async def scan_groups_for_alert():
                         
                         # 构建可点击的群名
                         if group_link:
-                            clickable_group_name = f"[{group_name}]({group_link})"
+                            safe_group_name = safe_markdown(group_name)
+                            clickable_group_name = f"[{safe_group_name}]({group_link})"
                         else:
-                            clickable_group_name = group_name
+                            clickable_group_name = safe_markdown(group_name)
                         
                         # 发送警示
                         alert_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -668,7 +669,12 @@ async def check_and_alert(event):
         except:
             group_link = None
         
-        clickable_group_name = f"[{group_name}]({group_link})" if group_link else group_name
+        # 构建可点击的群名（加上 safe_markdown）
+        if group_link:
+            safe_group_name = safe_markdown(group_name)
+            clickable_group_name = f"[{safe_group_name}]({group_link})"
+        else:
+            clickable_group_name = safe_markdown(group_name)
         
         should_alert = False
         trigger_word = ""
