@@ -673,12 +673,11 @@ async def check_and_alert(event):
             group_link = None
         
         # 构建可点击的群名 - 和转发消息格式完全一样
-        safe_group_name = safe_markdown(group_name)
+        clean_name = group_name.replace("(", "（").replace(")", "）").replace("_", "-").replace("*", "·")
         if group_link:
-            # 格式：【[群名](链接)】 - 和转发消息一模一样
-            clickable_group_name = f"【[{safe_group_name}]({group_link})】"
+            clickable_group_name = f"【[{clean_name}]({group_link})】"
         else:
-            clickable_group_name = safe_group_name
+            clickable_group_name = clean_name
         
         should_alert = False
         trigger_word = ""
