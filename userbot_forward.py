@@ -516,12 +516,6 @@ async def scan_groups_for_alert():
                         target_chat_id = config.ALERT_FORWARD_CHAT_ID or config.FORWARD_CHAT_ID
                         await send_alert_with_mention(target_chat_id, alert_message)
                         
-                        # 通知主人
-                        try:
-                            await client.send_message("me", f"🔔 群组警示（群名扫描）\n\n群组：{clickable_group_name}\n触发词：{', '.join(triggered_keywords)}\n时间：{alert_time}", parse_mode='md')
-                        except:
-                            pass
-                        
                         logger.info(f"⚠️ 群名扫描触发警示: {group_name} (关键词: {triggered_keywords})")
         
         logger.info(f"✅ 群组扫描完成 - 扫描: {scanned_count}个群, 触发警示: {alert_count}个")
@@ -628,39 +622,24 @@ async def forward_message(event, text):
 
 # ========= 发送警示消息 =========
 async def send_alert_with_mention(chat_id, message):
-    """发送警示消息（确保按钮显示）"""
+    """发送警示消息（简化版：只发消息，不要按钮）"""
     try:
-        from telethon import types
-        
-        # 第一步：发送警示文字（不带按钮）
+        # 构建完整消息（使用 Markdown 格式的链接）
         alert_header = "🔴🔴🔴 风险警示 🔴🔴🔴\n\n"
         full_message = f"{alert_header}{message}\n\n@all @all @all"
         
-        await client.send_message(chat_id, full_message)
-        
-        # 第二步：单独发送按钮消息
-        # 注意：按钮消息只能包含按钮，文字要分开
-        buttons = [
-            [types.KeyboardButtonUrl("⚠️ 点击了解风险", "https://t.me/telegram")],
-            [types.KeyboardButtonUrl("📞 联系管理员", f"tg://user?id={config.YOUR_USER_ID}")]
-        ]
-        
-        # 发送带按钮的消息（文字简短）
+        # 发送消息，使用 parse_mode='md' 让 Markdown 链接生效
         await client.send_message(
-            chat_id,
-            "📢 请点击下方按钮：",
-            buttons=buttons
+            chat_id, 
+            full_message, 
+            parse_mode='md'
         )
-        
-        # 第三步：发送最后提醒
-        await asyncio.sleep(0.5)
-        await client.send_message(chat_id, "@all 请务必查看上方风险警示！")
         
         logger.info(f"已发送警示消息到 {chat_id}")
         
     except Exception as e:
         logger.error(f"发送警示消息失败: {e}")
-        # 降级：普通消息
+        # 降级：不使用 Markdown
         try:
             await client.send_message(chat_id, f"🔴🔴🔴 风险警示 🔴🔴🔴\n\n{message}")
         except:
@@ -744,13 +723,6 @@ async def check_and_alert(event):
         # 发送警示
         target_chat_id = config.ALERT_FORWARD_CHAT_ID or config.FORWARD_CHAT_ID
         await send_alert_with_mention(target_chat_id, alert_message)
-        
-        # 同时发送给主人
-        try:
-            owner_msg = f"🔔 群组警示（{trigger_source}）\n\n群组：{clickable_group_name}\n触发词：{trigger_word}\n时间：{alert_time}"
-            await client.send_message("me", owner_msg, parse_mode='md')
-        except:
-            pass
         
         logger.info(f"⚠️ 发送群组警示: {group_name} (来源: {trigger_source}, 触发词: {trigger_word})")
         return True
