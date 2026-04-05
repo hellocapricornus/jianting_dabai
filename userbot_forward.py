@@ -100,6 +100,9 @@ class Config:
             
             # 休眠提醒配置
             self.SLEEP_NOTIFY_ENABLED = config.get("sleep_notify_enabled", True)
+
+            # ========= 在这里添加 =========
+            self.MENTION_USERS = config.get("mention_users", [])
             
             logger.info(f"✅ 配置文件加载成功: {self.config_path}")
             
@@ -485,7 +488,13 @@ async def forward_message(event, text):
         # ========= 检查是否包含担保关闭 =========
         warning_msg = ""
         if "担保关闭" in text.lower():
-            warning_msg = "\n\n🚨🚨🚨⚠️⚠️⚠️🚨🚨🚨 【担保关闭预警】\n请所有成员高度警惕，注意资金安全！\n@KFCVME50 @Edisonvme200 @Edcvme300 @Edisonvme100"
+            # 动态生成 @用户名
+            mentions = " ".join([f"@{user}" for user in config.MENTION_USERS])
+            warning_msg = f"""
+
+🚨🚨🚨⚠️⚠️⚠️🚨🚨🚨 【担保关闭预警】
+请所有成员高度警惕，注意资金安全！
+{mentions}"""
         
         # 构建消息
         msg = f"""【[{chat_title}]({chat_link})】
@@ -925,6 +934,58 @@ async def status_command(event):
     
     await event.reply(status_msg, parse_mode="md")
 
+@client.on(events.NewMessage(pattern=r'^/add_mention (\w+)'))
+async def add_mention(event):
+    """添加要@的用户名（仅自己可用）"""
+    if not event.is_private or not is_owner(event):
+        return
+    
+    username = event.pattern_match.group(1)
+    
+    if username not in config.MENTION_USERS:
+        config.MENTION_USERS.append(username)
+        # 保存到配置文件
+        with open("config.json", "r", encoding="utf-8") as f:
+            config_data = json.load(f)
+        config_data["mention_users"] = config.MENTION_USERS
+        with open("config.json", "w", encoding="utf-8") as f:
+            json.dump(config_data, f, ensure_ascii=False, indent=2)
+        await event.reply(f"✅ 已添加 @{username}")
+    else:
+        await event.reply(f"⚠️ @{username} 已存在")
+
+@client.on(events.NewMessage(pattern=r'^/remove_mention (\w+)'))
+async def remove_mention(event):
+    """删除要@的用户名（仅自己可用）"""
+    if not event.is_private or not is_owner(event):
+        return
+    
+    username = event.pattern_match.group(1)
+    
+    if username in config.MENTION_USERS:
+        config.MENTION_USERS.remove(username)
+        # 保存到配置文件
+        with open("config.json", "r", encoding="utf-8") as f:
+            config_data = json.load(f)
+        config_data["mention_users"] = config.MENTION_USERS
+        with open("config.json", "w", encoding="utf-8") as f:
+            json.dump(config_data, f, ensure_ascii=False, indent=2)
+        await event.reply(f"✅ 已删除 @{username}")
+    else:
+        await event.reply(f"⚠️ @{username} 不存在")
+
+@client.on(events.NewMessage(pattern=r'^/list_mention$'))
+async def list_mention(event):
+    """列出所有要@的用户名（仅自己可用）"""
+    if not event.is_private or not is_owner(event):
+        return
+    
+    if config.MENTION_USERS:
+        mention_list = "\n".join([f"• @{user}" for user in config.MENTION_USERS])
+        await event.reply(f"📋 **当前@用户列表：**\n{mention_list}")
+    else:
+        await event.reply("📋 当前没有要@的用户")
+
 @client.on(events.NewMessage(pattern=r'^/help$'))
 async def show_help(event):
     if not event.is_private or not is_owner(event):
@@ -947,15 +1008,11 @@ async def show_help(event):
 • `/mark_id <用户ID> <备注>` - 标记用户
 • `/unmark_id <用户ID>` - 取消标记
 
-**💡 功能说明：**
-• 自动检测群组暂停作业并发送警示
-• 进入/退出休眠时会自动通知
-• 支持配置文件热重载
-• 支持GitHub自动更新
-• 模拟真人在线/离线状态
+**📢 @用户管理命令：**
+• `/add_mention <用户名>` - 添加要@的用户（不含@符号）
+• `/remove_mention <用户名>` - 删除要@的用户
+• `/list_mention` - 查看当前@用户列表
 
-**配置文件：** `config.json`
-**日志文件：** `bot.log`
 """
     
     await event.reply(help_text, parse_mode="md")
