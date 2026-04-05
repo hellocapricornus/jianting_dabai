@@ -937,8 +937,6 @@ async def show_help(event):
 • `/status` - 查看详细状态
 • `/sleep` - 查看休眠状态
 • `/ping` - 测试机器人是否在线
-• `/alert_stats` - 查看警示系统统计
-• `/scan` - 手动扫描所有群组，检测群名警示词
 
 **⚙️ 管理命令：**
 • `/reload` - 重载配置文件
@@ -948,9 +946,6 @@ async def show_help(event):
 **🏷️ 标记命令：**
 • `/mark_id <用户ID> <备注>` - 标记用户
 • `/unmark_id <用户ID>` - 取消标记
-
-**🔔 警示命令：**
-• `/alert_group <群组名>` - 手动发送群组警示
 
 **💡 功能说明：**
 • 自动检测群组暂停作业并发送警示
