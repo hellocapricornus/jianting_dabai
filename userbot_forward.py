@@ -478,10 +478,35 @@ async def scan_groups_for_alert():
                         alert_manager.record_alert(group_id)
                         alert_count += 1
                         
+                        # ========= 构建可点击的群组链接 =========
+                        group_link = None
+                        try:
+                            # 尝试获取群组实体
+                            chat_entity = await client.get_entity(group_id)
+                            if chat_entity.username:
+                                # 有用户名：使用 t.me/username
+                                group_link = f"https://t.me/{chat_entity.username}"
+                            else:
+                                # 无用户名：使用 t.me/c/xxxxx 格式
+                                chat_id_str = str(group_id)
+                                if chat_id_str.startswith("-100"):
+                                    group_link = f"https://t.me/c/{chat_id_str[4:]}"
+                                else:
+                                    group_link = f"https://t.me/c/{abs(group_id)}"
+                        except Exception as e:
+                            logger.debug(f"获取群组链接失败 {group_name}: {e}")
+                            group_link = None
+                        
+                        # 构建可点击的群名
+                        if group_link:
+                            clickable_group_name = f"[{group_name}]({group_link})"
+                        else:
+                            clickable_group_name = group_name
+                        
                         # 发送警示
                         alert_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         alert_message = config.ALERT_MESSAGE.format(
-                            group_name=group_name,
+                            group_name=clickable_group_name,
                             time=alert_time,
                             trigger_word=", ".join(triggered_keywords)
                         )
@@ -493,7 +518,7 @@ async def scan_groups_for_alert():
                         
                         # 通知主人
                         try:
-                            await client.send_message("me", f"🔔 群组警示（群名扫描）\n\n群组：{group_name}\n触发词：{', '.join(triggered_keywords)}\n时间：{alert_time}")
+                            await client.send_message("me", f"🔔 群组警示（群名扫描）\n\n群组：{clickable_group_name}\n触发词：{', '.join(triggered_keywords)}\n时间：{alert_time}", parse_mode='md')
                         except:
                             pass
                         
@@ -502,6 +527,7 @@ async def scan_groups_for_alert():
         logger.info(f"✅ 群组扫描完成 - 扫描: {scanned_count}个群, 触发警示: {alert_count}个")
         
     except Exception as e:
+        logger.error(f"扫描群组失败: {e}")
         logger.error(f"扫描群组失败: {e}")
 
 async def periodic_group_scan():
@@ -639,6 +665,7 @@ async def send_alert_with_mention(chat_id, message):
             await client.send_message(chat_id, f"🔴🔴🔴 风险警示 🔴🔴🔴\n\n{message}")
         except:
             pass
+
 # ========= 检测群组警示 =========
 async def check_and_alert(event):
     """检测群组是否暂停作业并发送警示（增强版）"""
@@ -647,6 +674,22 @@ async def check_and_alert(event):
         group_name = getattr(chat, "title", "未知群组")
         group_id = event.chat_id
         message_text = event.message.message if event.message else ""
+        
+        # ========= 构建可点击的群组链接 =========
+        group_link = None
+        try:
+            if chat.username:
+                group_link = f"https://t.me/{chat.username}"
+            else:
+                chat_id_str = str(group_id)
+                if chat_id_str.startswith("-100"):
+                    group_link = f"https://t.me/c/{chat_id_str[4:]}"
+                else:
+                    group_link = f"https://t.me/c/{abs(group_id)}"
+        except:
+            group_link = None
+        
+        clickable_group_name = f"[{group_name}]({group_link})" if group_link else group_name
         
         should_alert = False
         trigger_word = ""
@@ -675,7 +718,7 @@ async def check_and_alert(event):
             return False
         
         # 检查冷却时间
-        if not alert_manager.should_alert(group_id, group_name, message_text, check_group_name=False):
+        if not alert_manager.should_alert(group_id, group_name, message_text):
             logger.debug(f"群组 {group_name} 在冷却期内，跳过警示")
             return False
         
@@ -685,7 +728,7 @@ async def check_and_alert(event):
         # 构建警示消息
         alert_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         alert_message = config.ALERT_MESSAGE.format(
-            group_name=group_name,
+            group_name=clickable_group_name,  # 使用可点击的群名
             time=alert_time,
             trigger_word=trigger_word
         )
@@ -704,8 +747,8 @@ async def check_and_alert(event):
         
         # 同时发送给主人
         try:
-            owner_msg = f"🔔 群组警示（{trigger_source}）\n\n群组：{group_name}\n触发词：{trigger_word}\n时间：{alert_time}"
-            await client.send_message("me", owner_msg)
+            owner_msg = f"🔔 群组警示（{trigger_source}）\n\n群组：{clickable_group_name}\n触发词：{trigger_word}\n时间：{alert_time}"
+            await client.send_message("me", owner_msg, parse_mode='md')
         except:
             pass
         
@@ -715,6 +758,7 @@ async def check_and_alert(event):
     except Exception as e:
         logger.error(f"check_and_alert 异常: {e}")
         return False
+        
 # ========= 休眠状态监控 =========
 async def sleep_status_monitor():
     """监控休眠状态变化，进入/退出休眠时发送提醒"""
