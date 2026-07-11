@@ -21,10 +21,34 @@ import os
 import subprocess
 import sys
 import random
+import unicodedata
 from telethon import functions
 from pathlib import Path
 from datetime import datetime
 import logging
+
+# ========= 预编译正则 =========
+_WS_RE = re.compile(r"\s+")
+# 零宽字符、软连字符、双向控制符等不可见字符（NFKC 不会移除这些）
+_INVISIBLE_RE = re.compile(
+    r"[\u00ad\u200b-\u200f\u2028-\u202e\u2060-\u2064\ufeff]"
+)
+
+# ========= 文本标准化 =========
+def normalize_text(text):
+    """
+    标准化文本：Unicode NFKC + 转小写 + 去除所有空白 + 去除不可见字符
+    - NFKC：全角转半角（ｖｘ → vx），合并兼容字符
+    - 去空白：防止 "微 信" / "V X" 这类插空格规避屏蔽词
+    - 去不可见字符：防止 "微­信"（软连字符）、"微​信"（零宽空格）等规避
+    """
+    if not text:
+        return ""
+    text = unicodedata.normalize("NFKC", text)
+    text = text.lower()
+    text = _WS_RE.sub("", text)
+    text = _INVISIBLE_RE.sub("", text)
+    return text
 
 # ========= 日志配置 =========
 logging.basicConfig(
@@ -75,12 +99,12 @@ class Config:
             self.ENABLE_AUTO_UPDATE = config.get("enable_auto_update", True)
             self.UPDATE_BRANCH = config.get("update_branch", "main")
             
-            # 关键词（转小写优化性能）
-            self.WHITE_KEYWORDS = {k.lower() for k in config.get("white_keywords", [])}
-            self.FILTER_KEYWORDS = {k.lower() for k in config.get("filter_keywords", [])}
-            self.COUNTRIES = {c.lower() for c in config.get("countries", [])}
-            self.BLOCK_KEYWORDS = {k.lower() for k in config.get("block_keywords", [])}
-            self.AD_KEYWORDS = {k.lower() for k in config.get("ad_keywords", [])}
+            # 关键词（统一标准化：NFKC + 小写 + 去空白，避免全角/插空格规避）
+            self.WHITE_KEYWORDS = {normalize_text(k) for k in config.get("white_keywords", [])}
+            self.FILTER_KEYWORDS = {normalize_text(k) for k in config.get("filter_keywords", [])}
+            self.COUNTRIES = {normalize_text(c) for c in config.get("countries", [])}
+            self.BLOCK_KEYWORDS = {normalize_text(k) for k in config.get("block_keywords", [])}
+            self.AD_KEYWORDS = {normalize_text(k) for k in config.get("ad_keywords", [])}
             
             # 正则表达式（预编译）
             ad_patterns = config.get("ad_patterns", [])
@@ -92,7 +116,7 @@ class Config:
             # 警示配置
             alert_config = config.get("alert_config", {})
             self.ALERT_ENABLED = alert_config.get("enabled", True)
-            self.TRIGGER_KEYWORDS = [k.lower() for k in alert_config.get("trigger_keywords", ["暂停作业"])]
+            self.TRIGGER_KEYWORDS = [normalize_text(k) for k in alert_config.get("trigger_keywords", ["暂停作业"])]
             self.ALERT_MESSAGE = alert_config.get("alert_message", "⚠️ 风险警示\n\n群组【{group_name}】已暂停作业！\n\n请谨慎交易，注意资金安全！\n\n时间：{time}")
             self.ALERT_MENTION_ALL = alert_config.get("mention_all", True)
             self.ALERT_COOLDOWN_MINUTES = alert_config.get("cooldown_minutes", 60)
@@ -103,6 +127,7 @@ class Config:
 
             # ========= 在这里添加 =========
             self.MENTION_USERS = config.get("mention_users", [])
+            self.FORWARD_BLACKLIST_USERS = config.get("forward_blacklist_users", [])
             
             logger.info(f"✅ 配置文件加载成功: {self.config_path}")
             
@@ -173,52 +198,52 @@ def safe_markdown(text):
     
     return text
 
-def normalize_text(text):
-    """标准化文本：转小写、去空格"""
-    text = text.lower()
-    text = re.sub(r"\s+", "", text)
-    return text
-
-# ========= 优化后的过滤函数 =========
+# ========= 过滤函数（统一使用 normalize_text 标准化后匹配） =========
 def is_white(text):
-    """白名单检查（已转小写优化）"""
-    text_lower = text.lower()
-    return any(k in text_lower for k in config.WHITE_KEYWORDS)
+    """白名单检查（标准化后匹配）"""
+    text_norm = normalize_text(text)
+    return any(k in text_norm for k in config.WHITE_KEYWORDS)
 
 def is_block(text):
-    """屏蔽词检查（已转小写优化）"""
-    text_lower = text.lower()
-    return any(k in text_lower for k in config.BLOCK_KEYWORDS)
+    """屏蔽词检查（标准化后匹配，防止全角/插空格规避）"""
+    text_norm = normalize_text(text)
+    return any(k in text_norm for k in config.BLOCK_KEYWORDS)
 
 def is_ad(text):
-    """广告检查（优化版）"""
-    text_lower = text.lower()
-    if any(k in text_lower for k in config.AD_KEYWORDS):
+    """广告检查（标准化后匹配关键词 + 原文匹配正则）"""
+    text_norm = normalize_text(text)
+    if any(k in text_norm for k in config.AD_KEYWORDS):
         return True
     return any(p.search(text) for p in config.AD_REGEX)
 
 def is_target(text):
-    """目标关键词检查（优化版）"""
-    text_lower = text.lower()
+    """目标关键词检查（标准化后匹配）"""
+    text_norm = normalize_text(text)
     
-    if any(k in text_lower for k in config.FILTER_KEYWORDS):
+    if any(k in text_norm for k in config.FILTER_KEYWORDS):
         return True
     
-    if any(c in text_lower for c in config.COUNTRIES):
+    if any(c in text_norm for c in config.COUNTRIES):
         return True
     
     return any(p.search(text) for p in config.FILTER_REGEX)
 
 # ========= 优化后的防抖 =========
 class DebounceManager:
-    """防抖管理器"""
+    """防抖管理器（动态读取 config，支持热重载）"""
     
     def __init__(self):
         self.cache = {}
-        self.debounce_time = config.DEBOUNCE_TIME
-        self.cache_expire = config.CACHE_EXPIRE
         self.hits = 0
         self.misses = 0
+    
+    @property
+    def debounce_time(self):
+        return config.DEBOUNCE_TIME
+    
+    @property
+    def cache_expire(self):
+        return config.CACHE_EXPIRE
     
     def is_duplicate(self, text):
         """检查是否重复"""
@@ -276,11 +301,14 @@ marked_users = load_marked_users()
 
 # ========= 警示管理器类 =========
 class AlertManager:
-    """群组警示管理器，防止重复警示"""
+    """群组警示管理器，防止重复警示（cooldown 动态读取，支持热重载）"""
     
     def __init__(self):
         self.alerted_groups = {}
-        self.cooldown = config.ALERT_COOLDOWN_MINUTES * 60
+    
+    @property
+    def cooldown(self):
+        return config.ALERT_COOLDOWN_MINUTES * 60
     
     def should_alert(self, group_id, group_name, message_text, check_group_name=False):
         """
@@ -295,16 +323,16 @@ class AlertManager:
         
         is_triggered = False
         
-        # 检查消息内容
+        # 检查消息内容（标准化后匹配，防止规避）
         if message_text:
-            text_lower = message_text.lower()
-            if any(kw in text_lower for kw in config.TRIGGER_KEYWORDS):
+            text_norm = normalize_text(message_text)
+            if any(kw in text_norm for kw in config.TRIGGER_KEYWORDS):
                 is_triggered = True
         
         # 检查群名（群名扫描或需要检查时）
         if not is_triggered and check_group_name and group_name:
-            group_name_lower = group_name.lower()
-            if any(kw in group_name_lower for kw in config.TRIGGER_KEYWORDS):
+            group_name_norm = normalize_text(group_name)
+            if any(kw in group_name_norm for kw in config.TRIGGER_KEYWORDS):
                 is_triggered = True
         
         if not is_triggered:
@@ -485,9 +513,9 @@ async def forward_message(event, text):
         
         text = safe_markdown(text)
         
-        # ========= 检查是否包含担保关闭 =========
+        # ========= 检查是否包含担保关闭（标准化后匹配，防止规避） =========
         warning_msg = ""
-        if "担保关闭" in text.lower():
+        if "担保关闭" in normalize_text(text):
             # 动态生成 @用户名
             mentions = " ".join([f"@{user}" for user in config.MENTION_USERS])
             warning_msg = f"""
@@ -532,7 +560,6 @@ async def forward_message(event, text):
         logger.warning(f"⚠️ FloodWait {e.seconds}s")
         await asyncio.sleep(e.seconds)
     except Exception as e:
-        logger.error(f"转发失败: {e}")
         logger.error(f"转发失败: {e}")
 
 # ========= 休眠状态监控 =========
@@ -638,17 +665,25 @@ async def heartbeat():
             await asyncio.sleep(config.HEARTBEAT_INTERVAL)
 
 # ========= 每日报告 =========
+def _safe_rate(numerator, denominator, fmt="{:.1f}"):
+    """安全计算百分比，避免除零"""
+    if not denominator:
+        return "0.0%"
+    return fmt.format(numerator / denominator * 100) + "%"
+
 async def daily_report():
     """每日报告"""
     global message_counter, forward_counter, start_time
     
+    # 启动后先发一次报告，便于确认运行状态
+    await asyncio.sleep(60)
+    
     while True:
         try:
-            await asyncio.sleep(86400)
-            
             uptime = int(time.time() - start_time)
             cache_stats = debounce_manager.get_stats()
             alert_stats = alert_manager.get_stats()
+            cache_total = cache_stats['hits'] + cache_stats['misses']
             
             report = f"""📊 机器人运行日报
 
@@ -657,12 +692,12 @@ async def daily_report():
 📈 今日统计:
    - 监听消息: {message_counter}
    - 转发消息: {forward_counter}
-   - 转发率: {(forward_counter/message_counter*100):.1f}% (如果有消息)
+   - 转发率: {_safe_rate(forward_counter, message_counter)}
 
 ⏱️ 运行时长: {uptime // 3600}小时 {(uptime % 3600) // 60}分钟
 
 💾 缓存效率:
-   - 命中率: {(cache_stats['hits']/(cache_stats['hits']+cache_stats['misses'])*100):.1f}% (如果有数据)
+   - 命中率: {_safe_rate(cache_stats['hits'], cache_total)}
    - 缓存大小: {cache_stats['size']}
 
 🔔 警示统计:
@@ -676,6 +711,8 @@ async def daily_report():
             
         except Exception as e:
             logger.error(f"daily_report 异常: {e}")
+        
+        await asyncio.sleep(86400)
 
 # ========= 定时清理 =========
 async def alert_cache_cleaner():
@@ -685,27 +722,74 @@ async def alert_cache_cleaner():
         alert_manager.clean_expired()
         logger.debug("警示缓存已清理")
 
+# ========= 警示发送 =========
+async def send_alert_with_mention(chat_id, alert_message):
+    """发送警示消息并 @ 相关用户"""
+    mentions = " ".join([f"@{user}" for user in config.MENTION_USERS])
+    full_message = f"{alert_message}\n{mentions}" if mentions else alert_message
+    
+    try:
+        await client.send_message(
+            chat_id,
+            full_message,
+            parse_mode="md",
+            link_preview=False
+        )
+    except FloodWaitError as e:
+        logger.warning(f"警示发送被限制: {e.seconds}s")
+        await asyncio.sleep(e.seconds)
+    except Exception as e:
+        logger.error(f"警示发送失败: {e}")
+
+async def scan_groups_for_alert():
+    """扫描所有群组，检查群名是否包含触发关键词"""
+    triggered = 0
+    scanned = 0
+    async for dialog in client.iter_dialogs():
+        if not (dialog.is_group or dialog.is_channel):
+            continue
+        if dialog.id == config.FORWARD_CHAT_ID:
+            continue
+        
+        scanned += 1
+        group_name = dialog.name or ""
+        group_id = dialog.id
+        
+        if alert_manager.should_alert(group_id, group_name, "", check_group_name=True):
+            alert_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            alert_message = config.ALERT_MESSAGE.format(
+                group_name=group_name,
+                time=alert_time
+            )
+            target_chat_id = config.ALERT_FORWARD_CHAT_ID or config.FORWARD_CHAT_ID
+            await send_alert_with_mention(target_chat_id, alert_message)
+            alert_manager.record_alert(group_id)
+            triggered += 1
+            await asyncio.sleep(random.uniform(1, 3))
+    
+    logger.info(f"群组扫描完成，共扫描 {scanned} 个群组，触发 {triggered} 个警示")
+    return triggered
+
 # ========= 私聊命令 =========
 async def init_user_id():
-    """初始化你的用户ID"""
-    global YOUR_USER_ID
+    """初始化你的用户ID并同步到配置文件"""
     me = await client.get_me()
-    YOUR_USER_ID = me.id
+    user_id = me.id
     
-    if config.YOUR_USER_ID is None or config.YOUR_USER_ID != YOUR_USER_ID:
-        logger.info(f"⚠️ 自动设置用户ID为: {YOUR_USER_ID}")
+    if config.YOUR_USER_ID is None or config.YOUR_USER_ID != user_id:
+        logger.info(f"⚠️ 自动设置用户ID为: {user_id}")
         try:
             with open("config.json", "r", encoding="utf-8") as f:
                 config_data = json.load(f)
-            config_data["your_user_id"] = YOUR_USER_ID
-            config.YOUR_USER_ID = YOUR_USER_ID
+            config_data["your_user_id"] = user_id
+            config.YOUR_USER_ID = user_id
             with open("config.json", "w", encoding="utf-8") as f:
                 json.dump(config_data, f, ensure_ascii=False, indent=2)
-            logger.info(f"✅ 用户ID已保存到配置文件: {YOUR_USER_ID}")
+            logger.info(f"✅ 用户ID已保存到配置文件: {user_id}")
         except Exception as e:
             logger.error(f"保存用户ID失败: {e}")
     
-    logger.info(f"✅ 当前用户ID: {YOUR_USER_ID}")
+    logger.info(f"✅ 当前用户ID: {config.YOUR_USER_ID}")
 
 def is_owner(event):
     return event.sender_id == config.YOUR_USER_ID
@@ -754,7 +838,7 @@ async def show_stats(event):
 
 📈 监听消息: `{message_counter}`
 📤 转发消息: `{forward_counter}`
-📊 转发率: `{(forward_counter/message_counter*100):.1f}%`
+📊 转发率: `{_safe_rate(forward_counter, message_counter)}`
 ⏱️ 运行时间: `{uptime // 3600}`小时 `{(uptime % 3600) // 60}`分钟
 
 💾 缓存统计:
@@ -780,7 +864,7 @@ async def reload_config(event):
         return
     try:
         config.load_config()
-        alert_manager.cooldown = config.ALERT_COOLDOWN_MINUTES * 60
+        # debounce_manager / alert_manager 的间隔已改为动态读取 config，无需手动同步
         await event.reply("✅ 配置重载成功")
         logger.info("配置重载成功")
     except Exception as e:
@@ -844,8 +928,7 @@ async def manual_alert(event):
     alert_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     alert_message = config.ALERT_MESSAGE.format(
         group_name=group_name,
-        time=alert_time,
-        trigger_word="手动触发"
+        time=alert_time
     )
     
     target_chat_id = config.ALERT_FORWARD_CHAT_ID or config.FORWARD_CHAT_ID
@@ -919,7 +1002,7 @@ async def status_command(event):
 **统计数据:**
 - 监听消息: `{message_counter}`
 - 转发消息: `{forward_counter}`
-- 转发率: `{(forward_counter/message_counter*100):.1f}%`
+- 转发率: `{_safe_rate(forward_counter, message_counter)}`
 
 **系统状态:**
 - 缓存大小: `{debounce_manager.get_size()}`
@@ -941,18 +1024,15 @@ async def add_mention(event):
         return
     
     username = event.pattern_match.group(1)
+    username_lower = username.lower()
     
-    if username not in config.MENTION_USERS:
-        config.MENTION_USERS.append(username)
-        # 保存到配置文件
-        with open("config.json", "r", encoding="utf-8") as f:
-            config_data = json.load(f)
-        config_data["mention_users"] = config.MENTION_USERS
-        with open("config.json", "w", encoding="utf-8") as f:
-            json.dump(config_data, f, ensure_ascii=False, indent=2)
-        await event.reply(f"✅ 已添加 @{username}")
-    else:
+    if any(u.lower() == username_lower for u in config.MENTION_USERS):
         await event.reply(f"⚠️ @{username} 已存在")
+        return
+    
+    config.MENTION_USERS.append(username)
+    _save_config_field("mention_users", config.MENTION_USERS)
+    await event.reply(f"✅ 已添加 @{username}")
 
 @client.on(events.NewMessage(pattern=r'^/remove_mention (\w+)'))
 async def remove_mention(event):
@@ -961,18 +1041,16 @@ async def remove_mention(event):
         return
     
     username = event.pattern_match.group(1)
+    username_lower = username.lower()
     
-    if username in config.MENTION_USERS:
-        config.MENTION_USERS.remove(username)
-        # 保存到配置文件
-        with open("config.json", "r", encoding="utf-8") as f:
-            config_data = json.load(f)
-        config_data["mention_users"] = config.MENTION_USERS
-        with open("config.json", "w", encoding="utf-8") as f:
-            json.dump(config_data, f, ensure_ascii=False, indent=2)
-        await event.reply(f"✅ 已删除 @{username}")
-    else:
-        await event.reply(f"⚠️ @{username} 不存在")
+    for i, u in enumerate(config.MENTION_USERS):
+        if u.lower() == username_lower:
+            del config.MENTION_USERS[i]
+            _save_config_field("mention_users", config.MENTION_USERS)
+            await event.reply(f"✅ 已删除 @{username}")
+            return
+    
+    await event.reply(f"⚠️ @{username} 不存在")
 
 @client.on(events.NewMessage(pattern=r'^/list_mention$'))
 async def list_mention(event):
@@ -985,6 +1063,68 @@ async def list_mention(event):
         await event.reply(f"📋 **当前@用户列表：**\n{mention_list}")
     else:
         await event.reply("📋 当前没有要@的用户")
+
+def _save_config_field(field_name, value):
+    """保存配置字段到 config.json（工具函数）"""
+    with open("config.json", "r", encoding="utf-8") as f:
+        config_data = json.load(f)
+    config_data[field_name] = value
+    with open("config.json", "w", encoding="utf-8") as f:
+        json.dump(config_data, f, ensure_ascii=False, indent=2)
+
+@client.on(events.NewMessage(pattern=r'^/add_blacklist (@?\w+)$'))
+async def add_blacklist(event):
+    """添加转发黑名单用户（仅自己可用，支持 @用户名 或 纯数字ID）"""
+    if not event.is_private or not is_owner(event):
+        return
+    
+    raw = event.pattern_match.group(1)
+    entry = raw.lstrip("@")  # 统一去掉 @ 前缀
+    entry_lower = entry.lower()
+    
+    if any(u.lstrip("@").lower() == entry_lower for u in config.FORWARD_BLACKLIST_USERS):
+        await event.reply(f"⚠️ {raw} 已在黑名单中")
+        return
+    
+    config.FORWARD_BLACKLIST_USERS.append(entry)
+    _save_config_field("forward_blacklist_users", config.FORWARD_BLACKLIST_USERS)
+    
+    kind = "数字ID" if entry.isdigit() else "用户名"
+    await event.reply(
+        f"✅ 已添加黑名单（{kind}）：{entry}\n"
+        f"该用户发送的消息将不再转发"
+    )
+
+@client.on(events.NewMessage(pattern=r'^/remove_blacklist (@?\w+)$'))
+async def remove_blacklist(event):
+    """删除转发黑名单用户（仅自己可用）"""
+    if not event.is_private or not is_owner(event):
+        return
+    
+    raw = event.pattern_match.group(1)
+    entry = raw.lstrip("@")
+    entry_lower = entry.lower()
+    
+    for i, u in enumerate(config.FORWARD_BLACKLIST_USERS):
+        if u.lstrip("@").lower() == entry_lower:
+            del config.FORWARD_BLACKLIST_USERS[i]
+            _save_config_field("forward_blacklist_users", config.FORWARD_BLACKLIST_USERS)
+            await event.reply(f"✅ 已从黑名单移除 {raw}")
+            return
+    
+    await event.reply(f"⚠️ {raw} 不在黑名单中")
+
+@client.on(events.NewMessage(pattern=r'^/list_blacklist$'))
+async def list_blacklist(event):
+    """列出转发黑名单用户（仅自己可用）"""
+    if not event.is_private or not is_owner(event):
+        return
+    
+    if config.FORWARD_BLACKLIST_USERS:
+        blist = "\n".join([f"• @{user}" for user in config.FORWARD_BLACKLIST_USERS])
+        await event.reply(f"🚫 **转发黑名单（共 {len(config.FORWARD_BLACKLIST_USERS)} 人）：**\n{blist}")
+    else:
+        await event.reply("🚫 转发黑名单为空")
 
 @client.on(events.NewMessage(pattern=r'^/help$'))
 async def show_help(event):
@@ -1012,6 +1152,11 @@ async def show_help(event):
 • `/add_mention <用户名>` - 添加要@的用户（不含@符号）
 • `/remove_mention <用户名>` - 删除要@的用户
 • `/list_mention` - 查看当前@用户列表
+
+**🚫 转发黑名单命令：**
+• `/add_blacklist <用户名或ID>` - 添加转发黑名单（支持 @用户名 或 纯数字ID）
+• `/remove_blacklist <用户名或ID>` - 删除转发黑名单用户
+• `/list_blacklist` - 查看转发黑名单列表
 
 """
     
@@ -1046,13 +1191,34 @@ async def handler(event):
             if config.check_reload():
                 logger.info("配置已热重载")
         
+        # 转发黑名单用户：优先级最高，直接跳过
+        # 支持用户名（@xxx 或 xxx）和数字 ID 两种形式
+        sender = await event.get_sender()
+        if sender:
+            sender_username = (sender.username or "").lower()
+            sender_id_str = str(sender.id)
+            for entry in config.FORWARD_BLACKLIST_USERS:
+                entry_clean = entry.lstrip("@").lower()
+                if not entry_clean:
+                    continue
+                # 匹配用户名
+                if entry_clean == sender_username and sender_username:
+                    logger.info(f"🚫 黑名单拦截（用户名）: @{sender_username} (id={sender_id_str})")
+                    return
+                # 匹配数字 ID
+                if entry_clean.isdigit() and entry_clean == sender_id_str:
+                    logger.info(f"🚫 黑名单拦截（ID）: id={sender_id_str} (@{sender_username or '无用户名'})")
+                    return
+        
+        # 白名单优先级最高：避免被宽泛的屏蔽词误伤
+        # （例如 "银行卡号后四位" 会被 "银行" 误屏蔽）
+        if is_white(text):
+            await forward_message(event, text)
+            return
+        
         if is_block(text):
             return
         if is_ad(text):
-            return
-        
-        if is_white(text):
-            await forward_message(event, text)
             return
         
         if not is_target(text):
@@ -1072,38 +1238,45 @@ async def handler(event):
 # ========= 主函数 =========
 async def main():
     """主函数"""
-    while True:
-        try:
-            await client.start()
-            await client.get_dialogs()
-            
-            await init_user_id()
-            
-            logger.info("✅ 机器人启动成功")
-            await client.send_message("me", "🤖 监听机器人已启动\n状态：运行中\n输入 /help 查看帮助")
-            
-            # 创建所有后台任务
-            tasks = [
-                asyncio.create_task(heartbeat()),
-                asyncio.create_task(daily_report()),
-                asyncio.create_task(github_auto_update()),
-                asyncio.create_task(simulate_human_offline()),
-                asyncio.create_task(alert_cache_cleaner()),
-                asyncio.create_task(sleep_status_monitor()),
-            ]
-            
-            await client.run_until_disconnected()
-            
-        except Exception as e:
-            logger.error(f"❌ 连接异常: {e}")
-            try:
-                await client.send_message("me", f"⚠️ 机器人异常\n{str(e)[:200]}\n5秒后重连")
-            except:
-                pass
-            await asyncio.sleep(5)
+    await client.start()
+    await client.get_dialogs()
+    
+    await init_user_id()
+    
+    logger.info("✅ 机器人启动成功")
+    await client.send_message("me", "🤖 监听机器人已启动\n状态：运行中\n输入 /help 查看帮助")
+    
+    # 创建所有后台任务
+    tasks = [
+        asyncio.create_task(heartbeat()),
+        asyncio.create_task(daily_report()),
+        asyncio.create_task(github_auto_update()),
+        asyncio.create_task(simulate_human_offline()),
+        asyncio.create_task(alert_cache_cleaner()),
+        asyncio.create_task(sleep_status_monitor()),
+    ]
+    
+    try:
+        # telethon 的 auto_reconnect=True 会自动处理断线重连
+        await client.run_until_disconnected()
+    finally:
+        # 优雅取消所有后台任务，避免任务泄漏
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        logger.info("所有后台任务已停止")
 
 if __name__ == "__main__":
     logger.info("启动 Telegram 监听机器人...")
-    
-    with client:
+    try:
         client.loop.run_until_complete(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("⚠️ 收到退出信号，正在关闭...")
+    finally:
+        # 事件循环可能已因异常中断，尽力清理连接
+        try:
+            if client.is_connected():
+                client.loop.run_until_complete(client.disconnect())
+        except Exception as e:
+            logger.debug(f"清理连接时: {e}")
+        logger.info("✅ 已退出")
