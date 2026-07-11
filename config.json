@@ -9,7 +9,6 @@
   "heartbeat_interval": 1800,
   "debounce_time": 60,
   "cache_expire": 3600,
-  "heartbeat_interval": 1800,
   "auto_update_interval": 14400,
   "enable_auto_update": true,
   "update_branch": "main",
