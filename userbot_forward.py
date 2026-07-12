@@ -1179,6 +1179,11 @@ async def handler(event):
         if not event.message or not event.message.message:
             return
         
+        # 跳过机器人发送的消息
+        sender = await event.get_sender()
+        if sender and sender.bot:
+            return
+        
         text = event.message.message.strip()
         if not text:
             return
