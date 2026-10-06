@@ -27,6 +27,7 @@ from telethon import functions
 from pathlib import Path
 from datetime import datetime
 import logging
+from logging.handlers import RotatingFileHandler
 
 # ========= 预编译正则 =========
 _WS_RE = re.compile(r"\s+")
@@ -56,7 +57,13 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('bot.log', encoding='utf-8'),
+        # 按大小轮转：单个日志最大 10MB，最多保留 5 份历史（bot.log.1 ~ bot.log.5）
+        RotatingFileHandler(
+            'bot.log',
+            maxBytes=20 * 1024 * 1024,
+            backupCount=10,
+            encoding='utf-8'
+        ),
         logging.StreamHandler()
     ]
 )
