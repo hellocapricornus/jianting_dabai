@@ -8,9 +8,10 @@ Telegram 消息监听转发机器人
 """
 
 from telethon import TelegramClient, events
-from telethon.errors import ChatRestrictedError, FloodWaitError
+from telethon.errors import ChatRestrictedError, FloodWaitError, ChannelPrivateError
 from telethon.network.connection.tcpabridged import ConnectionTcpAbridged
-from telethon.utils import get_display_name
+from telethon.utils import get_display_name, get_peer_id
+from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
 from telethon import types
 import re
 import time
@@ -1126,6 +1127,142 @@ async def list_blacklist(event):
     else:
         await event.reply("🚫 转发黑名单为空")
 
+# ========= 转发目标管理 =========
+_TME_INVITE_RE = re.compile(r"(?:https?://)?t\.me/(?:joinchat/|\+)([\w-]+)", re.I)
+_TME_LINK_RE = re.compile(r"(?:https?://)?t\.me/(.+)$", re.I)
+_USERNAME_RE = re.compile(r"^@?[A-Za-z]\w{3,31}$")
+
+def _is_group_or_channel(entity):
+    """判断实体是否为群组/频道（排除用户）"""
+    return isinstance(entity, (types.Channel, types.Chat))
+
+async def _resolve_forward_entity(raw):
+    """
+    按用户输入解析目标群组/频道实体。
+    成功解析会把最新 access_hash 写入会话缓存，可解决群重建后旧 hash 导致的 CHANNEL_PRIVATE。
+    支持：-100 数字ID、@用户名、t.me/用户名、t.me/c/内部链接、t.me/+邀请链接（含 joinchat）
+    """
+    raw = raw.strip()
+
+    # 1) 邀请链接：查询邀请状态，未加入则自动加入
+    invite_match = _TME_INVITE_RE.search(raw)
+    if invite_match:
+        invite_hash = invite_match.group(1)
+        invite = await client(CheckChatInviteRequest(hash=invite_hash))
+        if isinstance(invite, (types.ChatInviteAlready, types.ChatInvitePeek)):
+            return await client.get_entity(invite.chat)
+        if isinstance(invite, types.ChatInvite):
+            updates = await client(ImportChatInviteRequest(hash=invite_hash))
+            if not getattr(updates, "chats", None):
+                raise ValueError("已接受邀请，但未能获取群组信息，请稍后重试")
+            return await client.get_entity(updates.chats[0])
+        raise ValueError(f"无法识别的邀请信息: {type(invite).__name__}")
+
+    # 2) 其他形式：转换成 数字ID 或 用户名
+    peer = None
+    if re.fullmatch(r"-?\d+", raw):
+        peer = int(raw)
+    else:
+        link_match = _TME_LINK_RE.match(raw)
+        if link_match:
+            parts = link_match.group(1).strip("/").split("/")
+            if parts[0] == "c" and len(parts) >= 2 and parts[1].isdigit():
+                # 私有群内部链接 t.me/c/1234567890/123 -> -1001234567890
+                peer = int(f"-100{parts[1]}")
+            else:
+                peer = parts[0].split("?")[0] or None
+        elif _USERNAME_RE.match(raw):
+            peer = raw.lstrip("@")
+
+    if peer is None:
+        raise ValueError(
+            "无法识别的目标格式，支持：-100数字ID、@用户名、t.me链接、t.me/+邀请链接"
+        )
+
+    # 3) 解析实体；缓存缺失时（新会话/群刚重建）刷新对话列表后重试一次
+    try:
+        return await client.get_entity(peer)
+    except ValueError:
+        logger.info(f"本地缓存未命中目标 {peer}，刷新对话列表后重试")
+        await client.get_dialogs()
+        return await client.get_entity(peer)
+    except ChannelPrivateError:
+        raise ValueError("当前账号无权访问该群组（未加入或已被封禁），请先让账号加入该群")
+
+def _save_forward_target(new_id, old_id):
+    """把新的转发目标写入 config.json；警示群若沿用旧转发目标则一并跟随"""
+    with open("config.json", "r", encoding="utf-8") as f:
+        config_data = json.load(f)
+    config_data["forward_chat_id"] = new_id
+    if config.ALERT_FORWARD_CHAT_ID == old_id:
+        alert_config = config_data.setdefault("alert_config", {})
+        alert_config["alert_forward_chat_id"] = new_id
+    with open("config.json", "w", encoding="utf-8") as f:
+        json.dump(config_data, f, ensure_ascii=False, indent=2)
+
+@client.on(events.NewMessage(pattern=r'^/setforward(?:\s+(.+))?$'))
+async def set_forward_target(event):
+    """设置转发目标群组（仅自己可用，群内/私聊均可）"""
+    if not is_owner(event):
+        return
+
+    raw = event.pattern_match.group(1)
+    if event.is_private and not raw:
+        await event.reply(
+            "用法：\n"
+            "• 在目标群里直接发送：/setforward\n"
+            "• 私聊发送：/setforward <目标>\n"
+            "目标支持：-100数字ID、@用户名、t.me链接、t.me/+邀请链接"
+        )
+        return
+
+    try:
+        if raw:
+            entity = await _resolve_forward_entity(raw.strip())
+        else:
+            entity = await event.get_chat()
+
+        if not _is_group_or_channel(entity):
+            await event.reply("❌ 设置失败：目标必须是群组或频道，不能是用户")
+            return
+
+        title = getattr(entity, "title", str(get_peer_id(entity)))
+
+        # 发一条测试消息：验证发言权的同时让会话缓存写入最新 access_hash
+        try:
+            await client.send_message(entity, "✅ 本群已设置为消息转发目标")
+        except ChannelPrivateError:
+            await event.reply("❌ 当前账号无权访问该群组（未加入或已被封禁）")
+            return
+        except Exception as e:
+            await event.reply(f"❌ 能访问该群但无法发送消息，请检查发言权限：{e}")
+            return
+    except Exception as e:
+        await event.reply(f"❌ 设置失败：{e}")
+        return
+
+    new_id = get_peer_id(entity)
+    old_id = config.FORWARD_CHAT_ID
+
+    try:
+        _save_forward_target(new_id, old_id)
+    except Exception as e:
+        await event.reply(f"⚠️ 群体验证已通过，但写入 config.json 失败：{e}")
+        logger.error(f"保存转发目标失败: {e}")
+        return
+
+    config.FORWARD_CHAT_ID = new_id
+    if config.ALERT_FORWARD_CHAT_ID == old_id:
+        config.ALERT_FORWARD_CHAT_ID = new_id
+
+    logger.info(f"✅ 转发目标已变更: {old_id} -> {new_id} ({title})")
+    await event.reply(
+        f"✅ 转发目标已设置\n"
+        f"群组：{title}\n"
+        f"ID：{new_id}\n"
+        f"已即时生效，无需重启机器人"
+    )
+
 @client.on(events.NewMessage(pattern=r'^/help$'))
 async def show_help(event):
     if not event.is_private or not is_owner(event):
@@ -1144,7 +1281,11 @@ async def show_help(event):
 • `/update` - 手动检查并更新代码
 • `/help` - 显示此帮助
 
-**🏷️ 标记命令：**
+**� 转发目标命令：**
+• `/setforward` - 在目标群内发送：把当前群设为转发目标
+• `/setforward <ID/@用户名/链接>` - 私聊设置转发目标（支持 -100数字ID、@用户名、t.me链接、t.me/+邀请链接）
+
+**�🏷️ 标记命令：**
 • `/mark_id <用户ID> <备注>` - 标记用户
 • `/unmark_id <用户ID>` - 取消标记
 
